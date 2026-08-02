@@ -15,6 +15,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
@@ -23,7 +25,6 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -79,13 +80,11 @@ enum class InputSource {
 }
 
 /**
- * Représente l'état et le réglage de durée d'un step.
- * durationMultiplier : 1.0 = durée normale (celle du réglage global),
- * 0.25 à 4.0 = plus court/plus long que la normale.
+ * Représente l'état d'un step : ouvert (son passe) ou fermé (silence).
+ * La durée de tous les steps est réglée globalement (BPM + subdivision).
  */
 data class StepConfig(
-    val open: Boolean = false,
-    val durationMultiplier: Float = 1.0f
+    val open: Boolean = false
 )
 
 class GateEngine {
@@ -171,16 +170,6 @@ class GateEngine {
         pushHistory()
         val current = pattern[index]
         pattern[index] = current.copy(open = !current.open)
-    }
-
-    fun setStepDuration(index: Int, multiplier: Float) {
-        val current = pattern[index]
-        pattern[index] = current.copy(durationMultiplier = multiplier.coerceIn(0.25f, 4.0f))
-    }
-
-    /** À appeler une seule fois, juste avant de commencer à glisser un slider de durée. */
-    fun snapshotBeforeDurationEdit() {
-        pushHistory()
     }
 
     fun start() {
@@ -277,9 +266,10 @@ class GateEngine {
             val read = record.read(buffer, 0, buffer.size)
             if (read <= 0) continue
 
-            // Durée "normale" d'un step en échantillons, dérivée du BPM
-            // et de la subdivision choisie.
-            val baseStepSamples = sampleRate * 60.0 / bpm * stepSubdivision
+            // Durée d'un step en échantillons, identique pour tous les
+            // steps, dérivée du BPM et de la subdivision choisie.
+            val stepSamples = (sampleRate * 60.0 / bpm * stepSubdivision)
+                .toLong().coerceAtLeast(1)
 
             val patternLen = pattern.size.coerceAtLeast(1)
 
@@ -289,12 +279,10 @@ class GateEngine {
                 if (stepIdx >= patternLen) stepIdx = 0
 
                 val step = pattern.getOrElse(stepIdx) { StepConfig(open = true) }
-                val thisStepSamples = (baseStepSamples * step.durationMultiplier)
-                    .toLong().coerceAtLeast(1)
 
                 val distFromEdge = minOf(
                     posInCurrentStep,
-                    thisStepSamples - posInCurrentStep
+                    stepSamples - posInCurrentStep
                 )
                 val fadeGain = if (distFromEdge < fadeSamples) {
                     (distFromEdge.toDouble() / fadeSamples).coerceIn(0.0, 1.0)
@@ -305,7 +293,7 @@ class GateEngine {
                 buffer[i] = (buffer[i] * gain).toInt().toShort()
 
                 posInCurrentStep++
-                if (posInCurrentStep >= thisStepSamples) {
+                if (posInCurrentStep >= stepSamples) {
                     posInCurrentStep = 0
                     stepIdx = (stepIdx + 1) % patternLen
                 }
@@ -329,7 +317,6 @@ class GateEngine {
 fun CasioGateScreen(engine: GateEngine) {
 
     var playing by remember { mutableStateOf(false) }
-    var editingStepIndex by remember { mutableStateOf<Int?>(null) }
 
     Row(
         modifier = Modifier
@@ -338,11 +325,13 @@ fun CasioGateScreen(engine: GateEngine) {
             .padding(12.dp)
     ) {
 
-        // Colonne de gauche : contrôles
+        // Colonne de gauche : contrôles (scrollable pour rester accessible
+        // même en paysage sur un écran bas)
         Column(
             modifier = Modifier
                 .width(220.dp)
                 .fillMaxHeight()
+                .verticalScroll(rememberScrollState())
         ) {
 
             Text("CASIO GATE", color = Color.Red, style = MaterialTheme.typography.titleMedium)
@@ -443,27 +432,6 @@ fun CasioGateScreen(engine: GateEngine) {
                     fontSize = 12.sp
                 )
             }
-
-            // Panneau d'édition de la durée d'un step, si un step est sélectionné
-            editingStepIndex?.let { idx ->
-                if (idx < engine.pattern.size) {
-                    Spacer(Modifier.height(16.dp))
-                    Text("Step ${idx + 1} — durée", color = Color.Cyan, fontSize = 12.sp)
-                    Slider(
-                        value = engine.pattern[idx].durationMultiplier,
-                        onValueChange = { engine.setStepDuration(idx, it) },
-                        valueRange = 0.25f..4.0f
-                    )
-                    Text(
-                        "${"%.2f".format(engine.pattern[idx].durationMultiplier)}x",
-                        color = Color.White,
-                        fontSize = 11.sp
-                    )
-                    TextButton(onClick = { editingStepIndex = null }) {
-                        Text("Fermer", fontSize = 11.sp)
-                    }
-                }
-            }
         }
 
         Spacer(Modifier.width(16.dp))
@@ -487,31 +455,8 @@ fun CasioGateScreen(engine: GateEngine) {
                                 else -> Color.DarkGray
                             }
                         )
-                        .clickable { engine.toggleStep(i) },
-                    contentAlignment = Alignment.BottomEnd
-                ) {
-                    // Petit bouton pour ouvrir le réglage de durée du step
-                    Box(
-                        modifier = Modifier
-                            .size(16.dp)
-                            .background(Color.Cyan.copy(alpha = 0.6f))
-                            .clickable {
-                                if (editingStepIndex != i) {
-                                    engine.snapshotBeforeDurationEdit()
-                                }
-                                editingStepIndex = i
-                            }
-                    )
-                    if (step.durationMultiplier != 1.0f) {
-                        Text(
-                            "${"%.1f".format(step.durationMultiplier)}x",
-                            color = Color.Yellow,
-                            fontSize = 8.sp,
-                            fontWeight = FontWeight.Bold,
-                            modifier = Modifier.align(Alignment.TopStart)
-                        )
-                    }
-                }
+                        .clickable { engine.toggleStep(i) }
+                )
             }
         }
     }
