@@ -154,7 +154,7 @@ class GateEngine {
     private var running = false
     private var audioThread: Thread? = null
 
-    fun setStepCount(newCount: Int) {
+    fun changeStepCount(newCount: Int) {
         val clamped = newCount.coerceIn(2, 32)
         stepCount = clamped
         when {
@@ -390,7 +390,7 @@ fun CasioGateScreen(engine: GateEngine) {
             Text("Nombre de steps : ${engine.stepCount}", color = Color.White, fontSize = 13.sp)
             Slider(
                 value = engine.stepCount.toFloat(),
-                onValueChange = { engine.setStepCount(it.toInt()) },
+                onValueChange = { engine.changeStepCount(it.toInt()) },
                 valueRange = 2f..32f,
                 steps = 29
             )
