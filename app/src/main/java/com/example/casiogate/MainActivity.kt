@@ -153,13 +153,15 @@ class GateEngine(private val context: android.content.Context) {
     /** Liste les sorties audio actuellement disponibles (jack, Bluetooth, haut-parleur...). */
     fun availableOutputDevices(): List<AudioDeviceInfo> {
         val audioManager = context.getSystemService(android.content.Context.AUDIO_SERVICE) as AudioManager
-        return audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).filter { device ->
-            device.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
-            device.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
-            device.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
-            device.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
-            device.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
-        }
+        return audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+            .filter { device ->
+                device.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+                device.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                device.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
+                device.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+                device.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+            }
+            .distinctBy { it.type }
     }
 
     fun outputDeviceLabel(device: AudioDeviceInfo): String = when (device.type) {
@@ -244,13 +246,18 @@ class GateEngine(private val context: android.content.Context) {
     /** Liste les entrées audio actuellement disponibles (jack, micro intégré, USB...). */
     fun availableInputDevices(): List<AudioDeviceInfo> {
         val audioManager = context.getSystemService(android.content.Context.AUDIO_SERVICE) as AudioManager
-        return audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).filter { device ->
-            device.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
-            device.type == AudioDeviceInfo.TYPE_USB_DEVICE ||
-            device.type == AudioDeviceInfo.TYPE_USB_HEADSET ||
-            device.type == AudioDeviceInfo.TYPE_BUILTIN_MIC ||
-            device.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
-        }
+        return audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
+            .filter { device ->
+                device.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+                device.type == AudioDeviceInfo.TYPE_USB_DEVICE ||
+                device.type == AudioDeviceInfo.TYPE_USB_HEADSET ||
+                device.type == AudioDeviceInfo.TYPE_BUILTIN_MIC ||
+                device.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+            }
+            // Android expose parfois le même device physique deux fois
+            // (ex: deux entrées TYPE_BUILTIN_MIC). On ne garde qu'une
+            // entrée par type pour un affichage propre.
+            .distinctBy { it.type }
     }
 
     fun inputDeviceLabel(device: AudioDeviceInfo): String = when (device.type) {
