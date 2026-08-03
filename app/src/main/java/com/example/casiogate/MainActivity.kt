@@ -4,7 +4,9 @@ import android.Manifest
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
@@ -30,18 +32,21 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 
 /**
- * CASIO GATE v2
+ * CASIO GATE v3
  *
  * - Mode paysage forcé
  * - Nombre de steps réglable librement (2 à 32)
- * - Durée globale des steps (BPM + subdivision), avec possibilité de
- *   personnaliser la durée d'un step individuellement (multiplicateur
- *   par step, ex: 0.5x = deux fois plus court, 2x = deux fois plus long)
+ * - Tempo (BPM) + subdivision + gate width (durée son/silence à
+ *   chaque pulsation), identiques pour tous les steps
+ * - Détection automatique de tempo à partir du signal entrant, avec
+ *   tap tempo manuel en secours
+ * - Patterns rythmiques prédéfinis façon drum and bass, calés sur le
+ *   tempo détecté ou réglé manuellement
  */
 
 class MainActivity : ComponentActivity() {
 
-    private val gateEngine = GateEngine()
+    private val gateEngine by lazy { GateEngine(applicationContext) }
 
     private val requestMicPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -87,7 +92,83 @@ data class StepConfig(
     val open: Boolean = false
 )
 
-class GateEngine {
+/**
+ * Bibliothèque de patterns rythmiques prédéfinis, pensés pour la drum
+ * and bass. Chaque pattern est une liste de 16 booléens (steps ouverts/
+ * fermés) — s'applique en boucle même si stepCount n'est pas 16 (le
+ * moteur répète/tronque selon le nombre de steps réglé).
+ */
+object DnbPatterns {
+
+    // "Amen simplifié" : squelette syncopé inspiré du break le plus
+    // emblématique du genre — accents décalés, pas de grille régulière.
+    val amenSimplified = listOf(
+        true, false, false, true,
+        false, true, false, false,
+        false, false, true, false,
+        true, false, true, false
+    )
+
+    // Two-step : kick/snare alternés avec de vrais silences, plus épuré.
+    val twoStep = listOf(
+        true, false, false, false,
+        false, false, true, false,
+        false, false, false, false,
+        false, false, true, false
+    )
+
+    // Halftime : rythme perçu deux fois plus lent, plus lourd, très
+    // utilisé en DnB moderne — peu de steps actifs, bien espacés.
+    val halftime = listOf(
+        true, false, false, false,
+        false, false, false, false,
+        false, false, false, false,
+        true, false, false, false
+    )
+
+    // Rolling : pattern dense, sensation de continuité, beaucoup de
+    // steps actifs mais avec un léger groove syncopé.
+    val rolling = listOf(
+        true, false, true, true,
+        false, true, false, true,
+        true, false, true, true,
+        false, true, false, true
+    )
+
+    val all: Map<String, List<Boolean>> = linkedMapOf(
+        "Amen simplifié" to amenSimplified,
+        "Two-step" to twoStep,
+        "Halftime" to halftime,
+        "Rolling" to rolling
+    )
+}
+
+class GateEngine(private val context: android.content.Context) {
+
+    // Device de sortie forcé (ex: Bluetooth), indépendant de ce qui est
+    // branché en entrée sur le jack. null = comportement par défaut du
+    // système (généralement le jack s'il est branché).
+    var preferredOutputDevice by mutableStateOf<AudioDeviceInfo?>(null)
+
+    /** Liste les sorties audio actuellement disponibles (jack, Bluetooth, haut-parleur...). */
+    fun availableOutputDevices(): List<AudioDeviceInfo> {
+        val audioManager = context.getSystemService(android.content.Context.AUDIO_SERVICE) as AudioManager
+        return audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).filter { device ->
+            device.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+            device.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+            device.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
+            device.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+            device.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+        }
+    }
+
+    fun outputDeviceLabel(device: AudioDeviceInfo): String = when (device.type) {
+        AudioDeviceInfo.TYPE_BLUETOOTH_A2DP, AudioDeviceInfo.TYPE_BLUETOOTH_SCO ->
+            "Bluetooth" + (device.productName?.let { " ($it)" } ?: "")
+        AudioDeviceInfo.TYPE_WIRED_HEADPHONES, AudioDeviceInfo.TYPE_WIRED_HEADSET -> "Jack filaire"
+        AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "Haut-parleur"
+        else -> "Autre"
+    }
 
     var micPermissionGranted = false
 
@@ -155,6 +236,109 @@ class GateEngine {
     var gateWidth by mutableStateOf(0.5f)
 
     var inputSource by mutableStateOf(InputSource.MIC)
+
+    // --- Tap tempo (secours manuel) ---
+    private val tapTimestamps = ArrayDeque<Long>()
+    private val maxTapHistory = 6
+
+    /** À appeler à chaque tap du bouton "Tap tempo". */
+    fun registerTap() {
+        val now = System.currentTimeMillis()
+        tapTimestamps.addLast(now)
+        if (tapTimestamps.size > maxTapHistory) {
+            tapTimestamps.removeFirst()
+        }
+        if (tapTimestamps.size >= 2) {
+            val intervals = tapTimestamps.zipWithNext { a, b -> b - a }
+            val avgMs = intervals.average()
+            if (avgMs > 0) {
+                val newBpm = (60000.0 / avgMs).toInt().coerceIn(40, 220)
+                bpm = newBpm
+            }
+        }
+    }
+
+    // --- Détection automatique de tempo à partir du signal entrant ---
+    var autoDetectEnabled by mutableStateOf(false)
+    var detectedBpm by mutableStateOf<Int?>(null)
+        private set
+
+    // Historique des intervalles entre onsets détectés, pour estimer le
+    // BPM par la valeur la plus fréquente plutôt qu'une simple moyenne
+    // (plus robuste aux détections ratées ou aux double-déclenchements).
+    private val onsetIntervalHistoryMs = ArrayDeque<Long>()
+    private val maxOnsetHistory = 20
+    private var lastOnsetTimeMs = 0L
+    private var runningEnergy = 0.0
+    private val energySmoothing = 0.9
+
+    /**
+     * Analyse un buffer audio pour détecter un onset (attaque soudaine),
+     * et met à jour l'estimation de BPM si assez d'intervalles ont été
+     * capturés. Appelé depuis la boucle audio, sur le signal brut
+     * (avant gating), pour ne réagir qu'au vrai jeu du PT-20.
+     */
+    private fun analyzeForTempo(buffer: ShortArray, len: Int, sampleRate: Int) {
+        if (!autoDetectEnabled) return
+
+        // Énergie RMS de ce buffer
+        var sumSquares = 0.0
+        for (i in 0 until len) {
+            val s = buffer[i].toDouble()
+            sumSquares += s * s
+        }
+        val rms = kotlin.math.sqrt(sumSquares / len.coerceAtLeast(1))
+
+        // Moyenne mobile de l'énergie pour détecter les pics soudains
+        // (onset = énergie qui dépasse nettement la moyenne récente)
+        val previousRunning = runningEnergy
+        runningEnergy = energySmoothing * runningEnergy + (1 - energySmoothing) * rms
+
+        val threshold = previousRunning * 1.5 + 200.0 // marge pour éviter le bruit de fond
+        val now = System.currentTimeMillis()
+
+        if (rms > threshold && (now - lastOnsetTimeMs) > 120) {
+            // Onset détecté (avec un verrou de 120ms pour éviter les
+            // multiples déclenchements sur une même attaque)
+            if (lastOnsetTimeMs != 0L) {
+                val interval = now - lastOnsetTimeMs
+                if (interval in 150..2000) { // correspond à 30-400 BPM, filtre le bruit
+                    onsetIntervalHistoryMs.addLast(interval)
+                    if (onsetIntervalHistoryMs.size > maxOnsetHistory) {
+                        onsetIntervalHistoryMs.removeFirst()
+                    }
+                }
+            }
+            lastOnsetTimeMs = now
+
+            if (onsetIntervalHistoryMs.size >= 4) {
+                // BPM = valeur la plus fréquente (arrondie à 2 BPM près)
+                // parmi les intervalles récents, plutôt qu'une moyenne
+                // brute sensible aux valeurs aberrantes.
+                val bpmCandidates = onsetIntervalHistoryMs.map {
+                    (60000.0 / it).toInt() / 2 * 2
+                }
+                val mostCommon = bpmCandidates
+                    .groupingBy { it }
+                    .eachCount()
+                    .maxByOrNull { it.value }
+                    ?.key
+                if (mostCommon != null && mostCommon in 40..220) {
+                    detectedBpm = mostCommon
+                    bpm = mostCommon
+                }
+            }
+        }
+    }
+
+    /** Applique un pattern prédéfini (ex: DnB), adapté au nombre de steps actuel. */
+    fun applyPattern(source: List<Boolean>) {
+        pushHistory()
+        for (i in pattern.indices) {
+            val value = source.getOrElse(i % source.size) { false }
+            pattern[i] = StepConfig(open = value)
+        }
+    }
 
     private val fadeMs = 3
 
@@ -248,6 +432,13 @@ class GateEngine {
             .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
 
+        // Force la sortie vers le device choisi (ex: Bluetooth), même si
+        // un jack est branché en entrée — sans ça, Android route la
+        // sortie automatiquement vers le jack dès qu'il est inséré.
+        preferredOutputDevice?.let { device ->
+            track.preferredDevice = device
+        }
+
         if (record.state != AudioRecord.STATE_INITIALIZED) {
             record.release()
             track.release()
@@ -274,6 +465,10 @@ class GateEngine {
 
             val read = record.read(buffer, 0, buffer.size)
             if (read <= 0) continue
+
+            // Analyse le signal brut (avant gating) pour la détection de
+            // tempo, si activée — ne modifie pas le buffer.
+            analyzeForTempo(buffer, read, sampleRate)
 
             // Durée d'un step en échantillons, identique pour tous les
             // steps, dérivée du BPM et de la subdivision choisie.
@@ -375,6 +570,27 @@ fun CasioGateScreen(engine: GateEngine) {
                 )
             }
 
+            Spacer(Modifier.height(12.dp))
+
+            Text("Sortie :", color = Color.White, fontSize = 13.sp)
+            val outputs = remember { engine.availableOutputDevices() }
+            Column {
+                FilterChip(
+                    selected = engine.preferredOutputDevice == null,
+                    onClick = { engine.preferredOutputDevice = null },
+                    label = { Text("Auto (système)", fontSize = 11.sp) },
+                    modifier = Modifier.padding(vertical = 2.dp)
+                )
+                outputs.forEach { device ->
+                    FilterChip(
+                        selected = engine.preferredOutputDevice?.id == device.id,
+                        onClick = { engine.preferredOutputDevice = device },
+                        label = { Text(engine.outputDeviceLabel(device), fontSize = 11.sp) },
+                        modifier = Modifier.padding(vertical = 2.dp)
+                    )
+                }
+            }
+
             Spacer(Modifier.height(16.dp))
 
             Text("BPM : ${engine.bpm}", color = Color.White, fontSize = 13.sp)
@@ -383,6 +599,28 @@ fun CasioGateScreen(engine: GateEngine) {
                 onValueChange = { engine.bpm = it.toInt() },
                 valueRange = 40f..220f
             )
+
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                OutlinedButton(
+                    onClick = { engine.registerTap() },
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                ) {
+                    Text("Tap tempo", fontSize = 11.sp)
+                }
+                Spacer(Modifier.width(8.dp))
+                FilterChip(
+                    selected = engine.autoDetectEnabled,
+                    onClick = { engine.autoDetectEnabled = !engine.autoDetectEnabled },
+                    label = { Text("Auto BPM", fontSize = 11.sp) }
+                )
+            }
+            if (engine.autoDetectEnabled) {
+                Text(
+                    engine.detectedBpm?.let { "Détecté : $it BPM" } ?: "Détection en cours…",
+                    color = Color.Cyan,
+                    fontSize = 11.sp
+                )
+            }
 
             Spacer(Modifier.height(12.dp))
 
@@ -419,6 +657,22 @@ fun CasioGateScreen(engine: GateEngine) {
                 valueRange = 2f..32f,
                 steps = 29
             )
+
+            Spacer(Modifier.height(16.dp))
+
+            Text("Patterns DnB", color = Color.White, fontSize = 13.sp)
+            Spacer(Modifier.height(4.dp))
+            DnbPatterns.all.forEach { (name, stepsPattern) ->
+                OutlinedButton(
+                    onClick = { engine.applyPattern(stepsPattern) },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 2.dp),
+                    contentPadding = PaddingValues(vertical = 4.dp)
+                ) {
+                    Text(name, fontSize = 11.sp)
+                }
+            }
 
             Spacer(Modifier.height(16.dp))
 
