@@ -415,9 +415,15 @@ class GateEngine(private val context: android.content.Context) {
 
         val sampleRate = 44100
 
+        // Capture en STÉRÉO plutôt que mono : certains appareils (comme
+        // le PT-20) envoient un signal mono sur un seul canal (gauche OU
+        // droit) d'un jack stéréo. Capter en CHANNEL_IN_MONO ne lit que
+        // le canal gauche par défaut sur Android, ce qui donne un signal
+        // silencieux si la source utilise l'autre canal. En stéréo, on
+        // capte les deux canaux et on les fusionne nous-mêmes plus bas.
         val minRecordBuf = AudioRecord.getMinBufferSize(
             sampleRate,
-            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.CHANNEL_IN_STEREO,
             AudioFormat.ENCODING_PCM_16BIT
         )
 
@@ -448,7 +454,7 @@ class GateEngine(private val context: android.content.Context) {
         val record = AudioRecord(
             audioSource,
             sampleRate,
-            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.CHANNEL_IN_STEREO,
             AudioFormat.ENCODING_PCM_16BIT,
             minRecordBuf * 2
         )
@@ -489,8 +495,14 @@ class GateEngine(private val context: android.content.Context) {
             return
         }
 
-        val bufferFrames = 256
-        val buffer = ShortArray(bufferFrames)
+        // Buffer d'entrée en stéréo (entrelacé L,R,L,R...), donc deux fois
+        // plus d'échantillons que de frames.
+        val stereoFrames = 256
+        val stereoBuffer = ShortArray(stereoFrames * 2)
+
+        // Buffer de sortie mono, un échantillon par frame — c'est sur
+        // celui-ci que le gate est appliqué avant écriture.
+        val monoBuffer = ShortArray(stereoFrames)
 
         record.startRecording()
         track.play()
@@ -506,12 +518,25 @@ class GateEngine(private val context: android.content.Context) {
 
         while (running) {
 
-            val read = record.read(buffer, 0, buffer.size)
-            if (read <= 0) continue
+            val stereoRead = record.read(stereoBuffer, 0, stereoBuffer.size)
+            if (stereoRead <= 0) continue
+
+            // Fusionne les deux canaux stéréo en un seul flux mono, en
+            // sommant gauche+droite (clampé pour éviter le dépassement).
+            // Ça capte le signal peu importe sur quel canal le PT-20
+            // envoie réellement son mono.
+            val frameCount = stereoRead / 2
+            for (f in 0 until frameCount) {
+                val left = stereoBuffer[f * 2].toInt()
+                val right = stereoBuffer[f * 2 + 1].toInt()
+                val summed = (left + right).coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+                monoBuffer[f] = summed.toShort()
+            }
+            val read = frameCount
 
             // Analyse le signal brut (avant gating) pour la détection de
             // tempo, si activée — ne modifie pas le buffer.
-            analyzeForTempo(buffer, read, sampleRate)
+            analyzeForTempo(monoBuffer, read, sampleRate)
 
             // Durée d'un step en échantillons, identique pour tous les
             // steps, dérivée du BPM et de la subdivision choisie.
@@ -551,7 +576,7 @@ class GateEngine(private val context: android.content.Context) {
 
                 val gain = if (step.open && isInAudiblePortion) fadeGain else 0.0
 
-                buffer[i] = (buffer[i] * gain).toInt().toShort()
+                monoBuffer[i] = (monoBuffer[i] * gain).toInt().toShort()
 
                 posInCurrentStep++
                 if (posInCurrentStep >= stepSamples) {
@@ -560,7 +585,7 @@ class GateEngine(private val context: android.content.Context) {
                 }
             }
 
-            track.write(buffer, 0, read)
+            track.write(monoBuffer, 0, read)
 
             if (stepIdx != currentStep) {
                 currentStep = stepIdx
