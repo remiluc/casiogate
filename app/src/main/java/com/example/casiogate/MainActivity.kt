@@ -138,12 +138,21 @@ class GateEngine {
     var currentStep by mutableStateOf(0)
         private set
 
-    // BPM = tempo de référence pour la durée "normale" d'un step
+    // BPM = tempo de référence, fixe la vitesse du rythme (durée totale
+    // de chaque pulsation/step). Ne change jamais avec le gate width.
     var bpm by mutableStateOf(120)
 
-    // Subdivision de la durée normale d'un step, en fraction de noire.
+    // Subdivision de la durée d'un step, en fraction de noire.
     // 4.0 = noire, 2.0 = croche, 1.0 = double-croche (défaut), 0.5 = triple-croche
     var stepSubdivision by mutableStateOf(1.0f)
+
+    // Gate width (0.05 à 1.0) : proportion de chaque step pendant laquelle
+    // le son reste audible avant la coupure. 1.0 = son continu sur tout le
+    // step (pas de coupure), 0.5 = son audible sur la moitié du step puis
+    // silence, 0.1 = très court "blip" suivi d'un long silence.
+    // Ce réglage ne change JAMAIS la durée du step ni le tempo — seulement
+    // le ratio son/silence à l'intérieur de chaque pulsation.
+    var gateWidth by mutableStateOf(0.5f)
 
     var inputSource by mutableStateOf(InputSource.MIC)
 
@@ -280,15 +289,29 @@ class GateEngine {
 
                 val step = pattern.getOrElse(stepIdx) { StepConfig(open = true) }
 
-                val distFromEdge = minOf(
-                    posInCurrentStep,
-                    stepSamples - posInCurrentStep
-                )
+                // Durée pendant laquelle le son reste audible à l'intérieur
+                // de ce step, déterminée par gateWidth. Le step dans son
+                // ensemble (stepSamples) ne change jamais : seul ce sous-
+                // segment interne bouge, donc le tempo reste intact.
+                val audibleSamples = (stepSamples * gateWidth)
+                    .toLong().coerceIn(1, stepSamples)
+
+                val isInAudiblePortion = posInCurrentStep < audibleSamples
+
+                // Fondu anti-clic : au début du step (ouverture) et à la
+                // fin de la portion audible (fermeture avant le silence).
+                val distFromStart = posInCurrentStep
+                val distFromAudibleEnd = audibleSamples - posInCurrentStep
+                val distFromEdge = if (isInAudiblePortion) {
+                    minOf(distFromStart, distFromAudibleEnd)
+                } else {
+                    0L
+                }
                 val fadeGain = if (distFromEdge < fadeSamples) {
                     (distFromEdge.toDouble() / fadeSamples).coerceIn(0.0, 1.0)
                 } else 1.0
 
-                val gain = if (step.open) fadeGain else 0.0
+                val gain = if (step.open && isInAudiblePortion) fadeGain else 0.0
 
                 buffer[i] = (buffer[i] * gain).toInt().toShort()
 
@@ -364,7 +387,7 @@ fun CasioGateScreen(engine: GateEngine) {
             Spacer(Modifier.height(12.dp))
 
             Text(
-                "Durée de base : ${"%.2f".format(engine.stepSubdivision)}x noire",
+                "Subdivision : ${"%.2f".format(engine.stepSubdivision)}x noire",
                 color = Color.White,
                 fontSize = 13.sp
             )
@@ -372,6 +395,19 @@ fun CasioGateScreen(engine: GateEngine) {
                 value = engine.stepSubdivision,
                 onValueChange = { engine.stepSubdivision = it },
                 valueRange = 0.125f..2.0f
+            )
+
+            Spacer(Modifier.height(12.dp))
+
+            Text(
+                "Gate width : ${(engine.gateWidth * 100).toInt()}%",
+                color = Color.White,
+                fontSize = 13.sp
+            )
+            Slider(
+                value = engine.gateWidth,
+                onValueChange = { engine.gateWidth = it },
+                valueRange = 0.05f..1.0f
             )
 
             Spacer(Modifier.height(12.dp))
