@@ -237,6 +237,30 @@ class GateEngine(private val context: android.content.Context) {
 
     var inputSource by mutableStateOf(InputSource.MIC)
 
+    // Device d'entrée forcé (ex: jack physique), indépendant du choix
+    // MIC/USB_LINE générique. Prioritaire s'il est renseigné.
+    var preferredInputDevice by mutableStateOf<AudioDeviceInfo?>(null)
+
+    /** Liste les entrées audio actuellement disponibles (jack, micro intégré, USB...). */
+    fun availableInputDevices(): List<AudioDeviceInfo> {
+        val audioManager = context.getSystemService(android.content.Context.AUDIO_SERVICE) as AudioManager
+        return audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).filter { device ->
+            device.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+            device.type == AudioDeviceInfo.TYPE_USB_DEVICE ||
+            device.type == AudioDeviceInfo.TYPE_USB_HEADSET ||
+            device.type == AudioDeviceInfo.TYPE_BUILTIN_MIC ||
+            device.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+        }
+    }
+
+    fun inputDeviceLabel(device: AudioDeviceInfo): String = when (device.type) {
+        AudioDeviceInfo.TYPE_WIRED_HEADSET -> "Jack (entrée filaire)"
+        AudioDeviceInfo.TYPE_USB_DEVICE, AudioDeviceInfo.TYPE_USB_HEADSET -> "USB-C"
+        AudioDeviceInfo.TYPE_BUILTIN_MIC -> "Micro intégré"
+        AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "Bluetooth"
+        else -> "Autre"
+    }
+
     // --- Tap tempo (secours manuel) ---
     private val tapTimestamps = ArrayDeque<Long>()
     private val maxTapHistory = 6
@@ -401,9 +425,17 @@ class GateEngine(private val context: android.content.Context) {
             return
         }
 
-        val audioSource = when (inputSource) {
-            InputSource.MIC -> MediaRecorder.AudioSource.VOICE_RECOGNITION
-            InputSource.USB_LINE -> MediaRecorder.AudioSource.UNPROCESSED
+        // Si un device d'entrée précis est choisi (ex: jack physique),
+        // UNPROCESSED est la source la plus neutre — on force ensuite le
+        // device exact avec setPreferredDevice, qui prime sur le routage
+        // automatique du système.
+        val audioSource = if (preferredInputDevice != null) {
+            MediaRecorder.AudioSource.UNPROCESSED
+        } else {
+            when (inputSource) {
+                InputSource.MIC -> MediaRecorder.AudioSource.VOICE_RECOGNITION
+                InputSource.USB_LINE -> MediaRecorder.AudioSource.UNPROCESSED
+            }
         }
 
         val record = AudioRecord(
@@ -413,6 +445,10 @@ class GateEngine(private val context: android.content.Context) {
             AudioFormat.ENCODING_PCM_16BIT,
             minRecordBuf * 2
         )
+
+        preferredInputDevice?.let { device ->
+            record.preferredDevice = device
+        }
 
         val track = AudioTrack.Builder()
             .setAudioAttributes(
@@ -556,18 +592,23 @@ fun CasioGateScreen(engine: GateEngine) {
 
             Spacer(Modifier.height(12.dp))
 
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Entrée :", color = Color.White, fontSize = 13.sp)
+            val inputs = remember { engine.availableInputDevices() }
+            Column {
                 FilterChip(
-                    selected = engine.inputSource == InputSource.MIC,
-                    onClick = { engine.inputSource = InputSource.MIC },
-                    label = { Text("Micro", fontSize = 12.sp) }
+                    selected = engine.preferredInputDevice == null,
+                    onClick = { engine.preferredInputDevice = null },
+                    label = { Text("Auto (système)", fontSize = 11.sp) },
+                    modifier = Modifier.padding(vertical = 2.dp)
                 )
-                Spacer(Modifier.width(6.dp))
-                FilterChip(
-                    selected = engine.inputSource == InputSource.USB_LINE,
-                    onClick = { engine.inputSource = InputSource.USB_LINE },
-                    label = { Text("USB-C", fontSize = 12.sp) }
-                )
+                inputs.forEach { device ->
+                    FilterChip(
+                        selected = engine.preferredInputDevice?.id == device.id,
+                        onClick = { engine.preferredInputDevice = device },
+                        label = { Text(engine.inputDeviceLabel(device), fontSize = 11.sp) },
+                        modifier = Modifier.padding(vertical = 2.dp)
+                    )
+                }
             }
 
             Spacer(Modifier.height(12.dp))
