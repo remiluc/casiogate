@@ -2,7 +2,7 @@ name: Build APK
 
 on:
   push:
-    branches: [ main, dnb-experimental ]
+    branches: [ main, dnb-experimental, casio-gate-dnb-v2 ]
   workflow_dispatch:
 
 jobs:
