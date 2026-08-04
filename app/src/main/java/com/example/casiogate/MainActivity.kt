@@ -90,12 +90,25 @@ enum class FilterType {
 }
 
 /**
- * Représente l'état d'un step : ouvert (son passe) ou fermé (silence).
+ * Représente l'état d'un step, avec 3 possibilités :
+ * - fermé (silence)
+ * - ouvert normal (son passe, gaté selon gateWidth)
+ * - stutter (répète en boucle un court fragment capturé au début du
+ *   step, façon glitch/beat-repeat)
  * La durée de tous les steps est réglée globalement (BPM + subdivision).
  */
+enum class StepMode {
+    CLOSED,
+    OPEN,
+    STUTTER
+}
+
 data class StepConfig(
-    val open: Boolean = false
-)
+    val mode: StepMode = StepMode.CLOSED
+) {
+    // Compat : ancien champ "open" utilisé ailleurs dans le code
+    val open: Boolean get() = mode == StepMode.OPEN || mode == StepMode.STUTTER
+}
 
 /**
  * Bibliothèque de patterns rythmiques prédéfinis, pensés pour la drum
@@ -211,8 +224,8 @@ class GateEngine(private val context: android.content.Context) {
     fun randomize() {
         pushHistory()
         for (i in pattern.indices) {
-            val current = pattern[i]
-            pattern[i] = current.copy(open = kotlin.random.Random.nextBoolean())
+            val newMode = if (kotlin.random.Random.nextBoolean()) StepMode.OPEN else StepMode.CLOSED
+            pattern[i] = StepConfig(mode = newMode)
         }
     }
 
@@ -372,7 +385,7 @@ class GateEngine(private val context: android.content.Context) {
         pushHistory()
         for (i in pattern.indices) {
             val value = source.getOrElse(i % source.size) { false }
-            pattern[i] = StepConfig(open = value)
+            pattern[i] = StepConfig(mode = if (value) StepMode.OPEN else StepMode.CLOSED)
         }
     }
 
@@ -403,6 +416,35 @@ class GateEngine(private val context: android.content.Context) {
     // audible, mais reste visible sur la grille).
     var wetDryMix by mutableStateOf(1.0f)
 
+    // --- Bitcrush ---
+    // Bit depth réduit (1 à 16 bits). 16 = pas de réduction (qualité
+    // normale). Plus bas = moins de niveaux d'amplitude = son granuleux/
+    // saturé, typique d'un bitcrusher.
+    var crushBitDepthEnabled by mutableStateOf(false)
+    var crushBitDepth by mutableStateOf(16f)
+
+    // Sample rate réduit, exprimé comme un facteur de division du sample
+    // rate réel (1 = pas de réduction, 8 = un échantillon sur 8 est
+    // retenu, les autres répètent la dernière valeur retenue). Ça crée
+    // l'effet de repliement/aliasing métallique typique.
+    var crushSampleRateEnabled by mutableStateOf(false)
+    var crushSampleRateDivider by mutableStateOf(1f)
+    private var crushHoldSample: Short = 0
+    private var crushHoldCounter = 0
+
+    // --- Stutter ---
+    // Longueur du fragment répété en boucle sur les steps en mode
+    // STUTTER, exprimée en millisecondes. Court = glitch rapide/aigu,
+    // long = répétition plus lente et reconnaissable.
+    var stutterFragmentMs by mutableStateOf(40f)
+    // Buffer circulaire qui capture le fragment à répéter, rempli au
+    // début de chaque step en mode STUTTER et rejoué en boucle ensuite.
+    private var stutterCaptureBuffer = ShortArray(0)
+    private var stutterCaptured = false
+    private var stutterReadPos = 0
+    private var lastStutterStepIdx = -1
+
+
     @Volatile
     private var running = false
     private var audioThread: Thread? = null
@@ -420,10 +462,16 @@ class GateEngine(private val context: android.content.Context) {
         }
     }
 
+    /** Cycle un step à travers les 3 états : fermé -> ouvert -> stutter -> fermé. */
     fun toggleStep(index: Int) {
         pushHistory()
         val current = pattern[index]
-        pattern[index] = current.copy(open = !current.open)
+        val nextMode = when (current.mode) {
+            StepMode.CLOSED -> StepMode.OPEN
+            StepMode.OPEN -> StepMode.STUTTER
+            StepMode.STUTTER -> StepMode.CLOSED
+        }
+        pattern[index] = current.copy(mode = nextMode)
     }
 
     fun start() {
@@ -595,7 +643,49 @@ class GateEngine(private val context: android.content.Context) {
                 // Sécurité si le pattern a été redimensionné pendant la lecture
                 if (stepIdx >= patternLen) stepIdx = 0
 
-                val step = pattern.getOrElse(stepIdx) { StepConfig(open = true) }
+                val step = pattern.getOrElse(stepIdx) { StepConfig(mode = StepMode.OPEN) }
+
+                // --- Stutter : si ce step est en mode STUTTER, on
+                // remplace l'échantillon source par un fragment capturé
+                // au tout début du step, rejoué en boucle tant qu'on y
+                // reste. Le gate/fade s'applique ensuite normalement
+                // par-dessus ce signal en boucle.
+                var sourceSample = monoBuffer[i]
+
+                if (step.mode == StepMode.STUTTER) {
+                    val fragmentSamples = (sampleRate * stutterFragmentMs / 1000.0)
+                        .toInt().coerceIn(8, stepSamples.toInt().coerceAtLeast(8))
+
+                    // Nouveau step stutter : on (re)capture le fragment
+                    if (stepIdx != lastStutterStepIdx) {
+                        stutterCaptureBuffer = ShortArray(fragmentSamples)
+                        stutterCaptured = false
+                        stutterReadPos = 0
+                        lastStutterStepIdx = stepIdx
+                    }
+
+                    if (!stutterCaptured) {
+                        // Phase de capture : on enregistre le signal réel
+                        // entrant pendant les premiers fragmentSamples
+                        // échantillons du step.
+                        val capturePos = posInCurrentStep.toInt()
+                        if (capturePos < stutterCaptureBuffer.size) {
+                            stutterCaptureBuffer[capturePos] = sourceSample
+                        } else {
+                            stutterCaptured = true
+                        }
+                    } else {
+                        // Phase de relecture en boucle du fragment capturé
+                        if (stutterCaptureBuffer.isNotEmpty()) {
+                            sourceSample = stutterCaptureBuffer[stutterReadPos]
+                            stutterReadPos = (stutterReadPos + 1) % stutterCaptureBuffer.size
+                        }
+                    }
+                } else if (stepIdx != lastStutterStepIdx) {
+                    // On a quitté un step stutter, on nettoie l'état pour
+                    // le prochain step stutter rencontré.
+                    lastStutterStepIdx = -1
+                }
 
                 // Durée pendant laquelle le son reste audible à l'intérieur
                 // de ce step, déterminée par gateWidth. Le step dans son
@@ -619,9 +709,10 @@ class GateEngine(private val context: android.content.Context) {
                     (distFromEdge.toDouble() / fadeSamples).coerceIn(0.0, 1.0)
                 } else 1.0
 
-                val gateGain = if (step.open && isInAudiblePortion) fadeGain else 0.0
+                val stepIsAudible = step.mode == StepMode.OPEN || step.mode == StepMode.STUTTER
+                val gateGain = if (stepIsAudible && isInAudiblePortion) fadeGain else 0.0
 
-                var wetSample = monoBuffer[i] * gateGain
+                var wetSample = sourceSample * gateGain
 
                 // Filtre à un pôle, appliqué uniquement au signal traité
                 // (wet), pas au dry — pour que le wet/dry mix garde un
@@ -634,8 +725,28 @@ class GateEngine(private val context: android.content.Context) {
                     }
                 }
 
-                // Mix wet/dry : mélange le signal traité (gate+filtre) et
-                // le signal brut, puis applique le gain de sortie final.
+                // --- Bitcrush : réduction de sample rate (sample & hold)
+                // puis réduction de bit depth (quantification), appliqués
+                // uniquement au signal wet.
+                if (crushSampleRateEnabled) {
+                    val divider = crushSampleRateDivider.toInt().coerceAtLeast(1)
+                    if (crushHoldCounter <= 0) {
+                        crushHoldSample = wetSample.toInt().toShort()
+                        crushHoldCounter = divider
+                    }
+                    wetSample = crushHoldSample.toDouble()
+                    crushHoldCounter--
+                }
+
+                if (crushBitDepthEnabled) {
+                    val bits = crushBitDepth.toInt().coerceIn(1, 16)
+                    val levels = (1 shl bits) // nombre de niveaux d'amplitude possibles
+                    val step2 = 65536.0 / levels
+                    wetSample = (Math.round(wetSample / step2) * step2)
+                }
+
+                // Mix wet/dry : mélange le signal traité (gate+filtre+crush)
+                // et le signal brut, puis applique le gain de sortie final.
                 val drySample = dryBuffer[i].toDouble()
                 val mixed = wetSample * wetDryMix + drySample * (1.0 - wetDryMix)
                 val finalSample = (mixed * outputGain)
@@ -669,18 +780,32 @@ fun CasioGateScreen(engine: GateEngine) {
 
     var playing by remember { mutableStateOf(false) }
 
-    Row(
+    BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
-            .padding(12.dp)
     ) {
+        // Dimensions dérivées de la taille d'écran réelle, pour rester
+        // cohérent aussi bien sur téléphone que sur tablette.
+        // - La colonne de contrôles prend ~28% de la largeur, avec des
+        //   bornes raisonnables (jamais trop étroite, jamais démesurée).
+        // - Les cases de la grille grandissent avec l'écran, avec un
+        //   maximum pour ne pas devenir énormes sur un grand écran.
+        val controlsWidth = (maxWidth * 0.28f).coerceIn(200.dp, 340.dp)
+        val stepCellSize = (maxWidth * 0.06f).coerceIn(40.dp, 80.dp)
+        val basePadding = (maxWidth * 0.01f).coerceIn(8.dp, 20.dp)
+
+        Row(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(basePadding)
+        ) {
 
         // Colonne de gauche : contrôles (scrollable pour rester accessible
         // même en paysage sur un écran bas)
         Column(
             modifier = Modifier
-                .width(220.dp)
+                .width(controlsWidth)
                 .fillMaxHeight()
                 .verticalScroll(rememberScrollState())
         ) {
@@ -918,11 +1043,12 @@ fun CasioGateScreen(engine: GateEngine) {
                     val step = engine.pattern[i]
                     Box(
                         modifier = Modifier
-                            .size(48.dp)
+                            .size(stepCellSize)
                             .background(
                                 when {
                                     i == engine.currentStep && playing -> Color.White
-                                    step.open -> Color.Red
+                                    step.mode == StepMode.STUTTER -> Color.Yellow
+                                    step.mode == StepMode.OPEN -> Color.Red
                                     else -> Color.DarkGray
                                 }
                             )
@@ -930,6 +1056,75 @@ fun CasioGateScreen(engine: GateEngine) {
                     )
                 }
             }
+
+            Spacer(Modifier.height(20.dp))
+
+            Text("Bit crush", color = Color.Cyan, fontSize = 13.sp)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Actif", color = Color.White, fontSize = 12.sp)
+                Spacer(Modifier.width(8.dp))
+                FilterChip(
+                    selected = engine.crushBitDepthEnabled,
+                    onClick = { engine.crushBitDepthEnabled = !engine.crushBitDepthEnabled },
+                    label = { Text(if (engine.crushBitDepthEnabled) "ON" else "OFF", fontSize = 10.sp) }
+                )
+            }
+            if (engine.crushBitDepthEnabled) {
+                Text(
+                    "${engine.crushBitDepth.toInt()} bits",
+                    color = Color.White,
+                    fontSize = 11.sp
+                )
+                Slider(
+                    value = engine.crushBitDepth,
+                    onValueChange = { engine.crushBitDepth = it },
+                    valueRange = 1f..16f
+                )
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            Text("Sample crush", color = Color.Cyan, fontSize = 13.sp)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Actif", color = Color.White, fontSize = 12.sp)
+                Spacer(Modifier.width(8.dp))
+                FilterChip(
+                    selected = engine.crushSampleRateEnabled,
+                    onClick = { engine.crushSampleRateEnabled = !engine.crushSampleRateEnabled },
+                    label = { Text(if (engine.crushSampleRateEnabled) "ON" else "OFF", fontSize = 10.sp) }
+                )
+            }
+            if (engine.crushSampleRateEnabled) {
+                Text(
+                    "÷${engine.crushSampleRateDivider.toInt()}",
+                    color = Color.White,
+                    fontSize = 11.sp
+                )
+                Slider(
+                    value = engine.crushSampleRateDivider,
+                    onValueChange = { engine.crushSampleRateDivider = it },
+                    valueRange = 1f..64f
+                )
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            Text("Stutter", color = Color.Cyan, fontSize = 13.sp)
+            Text(
+                "Durée du fragment : ${engine.stutterFragmentMs.toInt()} ms",
+                color = Color.White,
+                fontSize = 12.sp
+            )
+            Slider(
+                value = engine.stutterFragmentMs,
+                onValueChange = { engine.stutterFragmentMs = it },
+                valueRange = 5f..200f
+            )
+            Text(
+                "Tap sur un step : fermé → ouvert → stutter → fermé",
+                color = Color.Gray,
+                fontSize = 10.sp
+            )
 
             Spacer(Modifier.height(20.dp))
 
@@ -968,6 +1163,7 @@ fun CasioGateScreen(engine: GateEngine) {
                     )
                 }
             }
+        }
         }
     }
 }
