@@ -84,6 +84,11 @@ enum class InputSource {
     USB_LINE
 }
 
+enum class FilterType {
+    LOWPASS,
+    HIGHPASS
+}
+
 /**
  * Représente l'état d'un step : ouvert (son passe) ou fermé (silence).
  * La durée de tous les steps est réglée globalement (BPM + subdivision).
@@ -371,7 +376,32 @@ class GateEngine(private val context: android.content.Context) {
         }
     }
 
-    private val fadeMs = 3
+    // Durée du fondu anti-clic à chaque transition son/silence, en ms.
+    // Plus court = coupure plus sèche/numérique, plus long = plus doux/
+    // analogique. 0.5ms mini (toujours nécessaire pour éviter le clic),
+    // 30ms max (au-delà ça devient audible comme un vrai fade, pas juste
+    // anti-clic).
+    var fadeMs by mutableStateOf(3f)
+
+    // Niveau de sortie général (0.0 à 2.0). 1.0 = signal inchangé,
+    // au-delà = amplification (utile si le PT-20 sort faible), en
+    // dessous = atténuation (utile pour éviter la saturation via un
+    // adaptateur USB-C mic-in comme discuté).
+    var outputGain by mutableStateOf(1.0f)
+
+    // Filtre simple à un pôle (passe-bas ou passe-haut), appliqué juste
+    // avant la sortie. cutoffHz : fréquence de coupure. filterType :
+    // choix entre passe-bas, passe-haut, ou désactivé.
+    var filterEnabled by mutableStateOf(false)
+    var filterType by mutableStateOf(FilterType.LOWPASS)
+    var filterCutoffHz by mutableStateOf(2000f)
+    private var filterState = 0.0 // état interne du filtre (mémoire d'1 échantillon)
+
+    // Wet/dry mix : proportion de signal traité (gate+filtre) vs signal
+    // brut non gaté, mélangés ensemble en sortie. 1.0 = 100% traité
+    // (comportement actuel), 0.0 = 100% brut (le gate n'a plus d'effet
+    // audible, mais reste visible sur la grille).
+    var wetDryMix by mutableStateOf(1.0f)
 
     @Volatile
     private var running = false
@@ -507,14 +537,16 @@ class GateEngine(private val context: android.content.Context) {
         record.startRecording()
         track.play()
 
-        val fadeSamples = (sampleRate * fadeMs / 1000.0).toInt().coerceAtLeast(1)
-
         // Position continue en échantillons depuis le début de la lecture.
         // On garde aussi l'index du step courant et la position (en
         // échantillons) à l'intérieur de ce step, pour supporter des
         // durées de step différentes les unes des autres.
         var stepIdx = 0
         var posInCurrentStep = 0L
+
+        // Buffer temporaire pour garder le signal brut (avant gate),
+        // nécessaire pour le wet/dry mix plus bas.
+        val dryBuffer = ShortArray(stereoFrames)
 
         while (running) {
 
@@ -531,6 +563,7 @@ class GateEngine(private val context: android.content.Context) {
                 val right = stereoBuffer[f * 2 + 1].toInt()
                 val summed = (left + right).coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
                 monoBuffer[f] = summed.toShort()
+                dryBuffer[f] = summed.toShort() // copie brute, avant tout traitement
             }
             val read = frameCount
 
@@ -543,7 +576,19 @@ class GateEngine(private val context: android.content.Context) {
             val stepSamples = (sampleRate * 60.0 / bpm * stepSubdivision)
                 .toLong().coerceAtLeast(1)
 
+            // Fondu anti-clic, recalculé à chaque buffer pour rester
+            // réactif si l'utilisateur ajuste fadeMs en cours de lecture.
+            val fadeSamples = (sampleRate * fadeMs / 1000.0).toInt().coerceAtLeast(1)
+
             val patternLen = pattern.size.coerceAtLeast(1)
+
+            // Coefficient du filtre à un pôle, recalculé à chaque buffer
+            // pour rester réactif si l'utilisateur change cutoffHz.
+            // alpha proche de 0 = filtre très marqué, proche de 1 = filtre
+            // léger (formule standard RC one-pole).
+            val rc = 1.0 / (2.0 * Math.PI * filterCutoffHz)
+            val dt = 1.0 / sampleRate
+            val alpha = dt / (rc + dt)
 
             for (i in 0 until read) {
 
@@ -574,9 +619,29 @@ class GateEngine(private val context: android.content.Context) {
                     (distFromEdge.toDouble() / fadeSamples).coerceIn(0.0, 1.0)
                 } else 1.0
 
-                val gain = if (step.open && isInAudiblePortion) fadeGain else 0.0
+                val gateGain = if (step.open && isInAudiblePortion) fadeGain else 0.0
 
-                monoBuffer[i] = (monoBuffer[i] * gain).toInt().toShort()
+                var wetSample = monoBuffer[i] * gateGain
+
+                // Filtre à un pôle, appliqué uniquement au signal traité
+                // (wet), pas au dry — pour que le wet/dry mix garde un
+                // signal brut non filtré comme référence.
+                if (filterEnabled) {
+                    filterState += alpha * (wetSample - filterState)
+                    wetSample = when (filterType) {
+                        FilterType.LOWPASS -> filterState
+                        FilterType.HIGHPASS -> wetSample - filterState
+                    }
+                }
+
+                // Mix wet/dry : mélange le signal traité (gate+filtre) et
+                // le signal brut, puis applique le gain de sortie final.
+                val drySample = dryBuffer[i].toDouble()
+                val mixed = wetSample * wetDryMix + drySample * (1.0 - wetDryMix)
+                val finalSample = (mixed * outputGain)
+                    .coerceIn(Short.MIN_VALUE.toDouble(), Short.MAX_VALUE.toDouble())
+
+                monoBuffer[i] = finalSample.toInt().toShort()
 
                 posInCurrentStep++
                 if (posInCurrentStep >= stepSamples) {
@@ -677,6 +742,84 @@ fun CasioGateScreen(engine: GateEngine) {
                 value = engine.gateWidth,
                 onValueChange = { engine.gateWidth = it },
                 valueRange = 0.05f..1.0f
+            )
+
+            Spacer(Modifier.height(16.dp))
+            Text("Traitement sonore", color = Color.Cyan, fontSize = 13.sp)
+            Spacer(Modifier.height(8.dp))
+
+            Text(
+                "Fade (anti-clic) : ${"%.1f".format(engine.fadeMs)} ms",
+                color = Color.White,
+                fontSize = 12.sp
+            )
+            Slider(
+                value = engine.fadeMs,
+                onValueChange = { engine.fadeMs = it },
+                valueRange = 0.5f..30f
+            )
+
+            Spacer(Modifier.height(8.dp))
+
+            Text(
+                "Niveau de sortie : ${(engine.outputGain * 100).toInt()}%",
+                color = Color.White,
+                fontSize = 12.sp
+            )
+            Slider(
+                value = engine.outputGain,
+                onValueChange = { engine.outputGain = it },
+                valueRange = 0f..2f
+            )
+
+            Spacer(Modifier.height(8.dp))
+
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Filtre", color = Color.White, fontSize = 12.sp)
+                Spacer(Modifier.width(8.dp))
+                FilterChip(
+                    selected = engine.filterEnabled,
+                    onClick = { engine.filterEnabled = !engine.filterEnabled },
+                    label = { Text(if (engine.filterEnabled) "ON" else "OFF", fontSize = 10.sp) }
+                )
+            }
+            if (engine.filterEnabled) {
+                Row {
+                    FilterChip(
+                        selected = engine.filterType == FilterType.LOWPASS,
+                        onClick = { engine.filterType = FilterType.LOWPASS },
+                        label = { Text("Passe-bas", fontSize = 10.sp) }
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    FilterChip(
+                        selected = engine.filterType == FilterType.HIGHPASS,
+                        onClick = { engine.filterType = FilterType.HIGHPASS },
+                        label = { Text("Passe-haut", fontSize = 10.sp) }
+                    )
+                }
+                Text(
+                    "Coupure : ${engine.filterCutoffHz.toInt()} Hz",
+                    color = Color.White,
+                    fontSize = 11.sp
+                )
+                Slider(
+                    value = engine.filterCutoffHz,
+                    onValueChange = { engine.filterCutoffHz = it },
+                    valueRange = 100f..8000f
+                )
+            }
+
+            Spacer(Modifier.height(8.dp))
+
+            Text(
+                "Wet/Dry : ${(engine.wetDryMix * 100).toInt()}% traité",
+                color = Color.White,
+                fontSize = 12.sp
+            )
+            Slider(
+                value = engine.wetDryMix,
+                onValueChange = { engine.wetDryMix = it },
+                valueRange = 0f..1f
             )
 
             Spacer(Modifier.height(12.dp))
