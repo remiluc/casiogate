@@ -624,48 +624,6 @@ fun CasioGateScreen(engine: GateEngine) {
 
             Spacer(Modifier.height(12.dp))
 
-            Text("Entrée :", color = Color.White, fontSize = 13.sp)
-            val inputs = remember { engine.availableInputDevices() }
-            Column {
-                FilterChip(
-                    selected = engine.preferredInputDevice == null,
-                    onClick = { engine.preferredInputDevice = null },
-                    label = { Text("Auto (système)", fontSize = 11.sp) },
-                    modifier = Modifier.padding(vertical = 2.dp)
-                )
-                inputs.forEach { device ->
-                    FilterChip(
-                        selected = engine.preferredInputDevice?.id == device.id,
-                        onClick = { engine.preferredInputDevice = device },
-                        label = { Text(engine.inputDeviceLabel(device), fontSize = 11.sp) },
-                        modifier = Modifier.padding(vertical = 2.dp)
-                    )
-                }
-            }
-
-            Spacer(Modifier.height(12.dp))
-
-            Text("Sortie :", color = Color.White, fontSize = 13.sp)
-            val outputs = remember { engine.availableOutputDevices() }
-            Column {
-                FilterChip(
-                    selected = engine.preferredOutputDevice == null,
-                    onClick = { engine.preferredOutputDevice = null },
-                    label = { Text("Auto (système)", fontSize = 11.sp) },
-                    modifier = Modifier.padding(vertical = 2.dp)
-                )
-                outputs.forEach { device ->
-                    FilterChip(
-                        selected = engine.preferredOutputDevice?.id == device.id,
-                        onClick = { engine.preferredOutputDevice = device },
-                        label = { Text(engine.outputDeviceLabel(device), fontSize = 11.sp) },
-                        modifier = Modifier.padding(vertical = 2.dp)
-                    )
-                }
-            }
-
-            Spacer(Modifier.height(16.dp))
-
             Text("BPM : ${engine.bpm}", color = Color.White, fontSize = 13.sp)
             Slider(
                 value = engine.bpm.toFloat(),
@@ -731,6 +689,34 @@ fun CasioGateScreen(engine: GateEngine) {
                 steps = 29
             )
 
+            Spacer(Modifier.height(12.dp))
+
+            Row(modifier = Modifier.fillMaxWidth()) {
+                OutlinedButton(
+                    onClick = { engine.randomize() },
+                    modifier = Modifier.weight(1f),
+                    contentPadding = PaddingValues(4.dp)
+                ) {
+                    Text("Random", fontSize = 11.sp)
+                }
+                Spacer(Modifier.width(4.dp))
+                OutlinedButton(
+                    onClick = { engine.reset() },
+                    modifier = Modifier.weight(1f),
+                    contentPadding = PaddingValues(4.dp)
+                ) {
+                    Text("Reset", fontSize = 11.sp)
+                }
+                Spacer(Modifier.width(4.dp))
+                OutlinedButton(
+                    onClick = { engine.undo() },
+                    modifier = Modifier.weight(1f),
+                    contentPadding = PaddingValues(4.dp)
+                ) {
+                    Text("Undo", fontSize = 11.sp)
+                }
+            }
+
             Spacer(Modifier.height(16.dp))
 
             Text("Patterns DnB", color = Color.White, fontSize = 13.sp)
@@ -759,34 +745,6 @@ fun CasioGateScreen(engine: GateEngine) {
                 Text(if (playing) "STOP" else "PLAY")
             }
 
-            Spacer(Modifier.height(10.dp))
-
-            Row(modifier = Modifier.fillMaxWidth()) {
-                OutlinedButton(
-                    onClick = { engine.randomize() },
-                    modifier = Modifier.weight(1f),
-                    contentPadding = PaddingValues(4.dp)
-                ) {
-                    Text("Random", fontSize = 11.sp)
-                }
-                Spacer(Modifier.width(4.dp))
-                OutlinedButton(
-                    onClick = { engine.reset() },
-                    modifier = Modifier.weight(1f),
-                    contentPadding = PaddingValues(4.dp)
-                ) {
-                    Text("Reset", fontSize = 11.sp)
-                }
-                Spacer(Modifier.width(4.dp))
-                OutlinedButton(
-                    onClick = { engine.undo() },
-                    modifier = Modifier.weight(1f),
-                    contentPadding = PaddingValues(4.dp)
-                ) {
-                    Text("Undo", fontSize = 11.sp)
-                }
-            }
-
             if (!engine.micPermissionGranted) {
                 Spacer(Modifier.height(12.dp))
                 Text(
@@ -799,27 +757,73 @@ fun CasioGateScreen(engine: GateEngine) {
 
         Spacer(Modifier.width(16.dp))
 
-        // Grille de steps à droite, s'adapte au nombre de steps
-        LazyVerticalGrid(
-            columns = GridCells.Fixed(8),
-            modifier = Modifier.fillMaxHeight(),
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp)
+        // Colonne de droite : grille de steps, puis en dessous les
+        // réglages d'entrée/sortie audio.
+        Column(
+            modifier = Modifier
+                .fillMaxHeight()
+                .verticalScroll(rememberScrollState())
         ) {
-            items(engine.pattern.size) { i ->
-                val step = engine.pattern[i]
-                Box(
-                    modifier = Modifier
-                        .size(48.dp)
-                        .background(
-                            when {
-                                i == engine.currentStep && playing -> Color.White
-                                step.open -> Color.Red
-                                else -> Color.DarkGray
-                            }
-                        )
-                        .clickable { engine.toggleStep(i) }
+
+            LazyVerticalGrid(
+                columns = GridCells.Fixed(8),
+                modifier = Modifier.height(220.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                items(engine.pattern.size) { i ->
+                    val step = engine.pattern[i]
+                    Box(
+                        modifier = Modifier
+                            .size(48.dp)
+                            .background(
+                                when {
+                                    i == engine.currentStep && playing -> Color.White
+                                    step.open -> Color.Red
+                                    else -> Color.DarkGray
+                                }
+                            )
+                            .clickable { engine.toggleStep(i) }
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(20.dp))
+
+            Text("Entrée :", color = Color.White, fontSize = 13.sp)
+            val inputs = remember { engine.availableInputDevices() }
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                FilterChip(
+                    selected = engine.preferredInputDevice == null,
+                    onClick = { engine.preferredInputDevice = null },
+                    label = { Text("Auto (système)", fontSize = 11.sp) }
                 )
+                inputs.forEach { device ->
+                    FilterChip(
+                        selected = engine.preferredInputDevice?.id == device.id,
+                        onClick = { engine.preferredInputDevice = device },
+                        label = { Text(engine.inputDeviceLabel(device), fontSize = 11.sp) }
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            Text("Sortie :", color = Color.White, fontSize = 13.sp)
+            val outputs = remember { engine.availableOutputDevices() }
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                FilterChip(
+                    selected = engine.preferredOutputDevice == null,
+                    onClick = { engine.preferredOutputDevice = null },
+                    label = { Text("Auto (système)", fontSize = 11.sp) }
+                )
+                outputs.forEach { device ->
+                    FilterChip(
+                        selected = engine.preferredOutputDevice?.id == device.id,
+                        onClick = { engine.preferredOutputDevice = device },
+                        label = { Text(engine.outputDeviceLabel(device), fontSize = 11.sp) }
+                    )
+                }
             }
         }
     }
