@@ -1,6 +1,13 @@
 package com.example.casiogate
 
 import android.Manifest
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Context
+import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
@@ -10,10 +17,14 @@ import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
+import android.os.Build
 import android.os.Bundle
+import android.os.IBinder
+import android.os.PowerManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -22,6 +33,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -29,6 +41,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 
 /**
@@ -44,14 +57,121 @@ import androidx.core.content.ContextCompat
  *   tempo détecté ou réglé manuellement
  */
 
+/**
+ * Service qui héberge le GateEngine et tourne en foreground, avec un
+ * WakeLock partiel — permet au traitement audio de continuer même
+ * lorsque l'écran s'éteint ou que le téléphone est verrouillé. Sans ça,
+ * Android suspend le thread audio après quelques secondes d'écran
+ * éteint (Doze mode / App Standby), ce qui couperait le son en plein
+ * live.
+ */
+class GateForegroundService : Service() {
+
+    private val binder = LocalBinder()
+    lateinit var engine: GateEngine
+        private set
+    private var wakeLock: PowerManager.WakeLock? = null
+
+    inner class LocalBinder : android.os.Binder() {
+        fun getService(): GateForegroundService = this@GateForegroundService
+    }
+
+    override fun onBind(intent: Intent?): IBinder = binder
+
+    override fun onCreate() {
+        super.onCreate()
+        engine = GateEngine(applicationContext)
+        engine.onStartPlayback = { acquireWakeLock() }
+        engine.onStopPlayback = { releaseWakeLock() }
+
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = powerManager.newWakeLock(
+            PowerManager.PARTIAL_WAKE_LOCK,
+            "CasioGate::AudioWakeLock"
+        )
+
+        startForeground(NOTIFICATION_ID, buildNotification())
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // START_STICKY : si le système tue le service pour libérer de la
+        // mémoire, il tentera de le relancer — utile pour un usage live
+        // où on ne veut pas perdre le son en cours de route.
+        return START_STICKY
+    }
+
+    fun acquireWakeLock() {
+        wakeLock?.let { if (!it.isHeld) it.acquire(4 * 60 * 60 * 1000L) } // max 4h de sécurité
+    }
+
+    fun releaseWakeLock() {
+        wakeLock?.let { if (it.isHeld) it.release() }
+    }
+
+    private fun buildNotification(): Notification {
+        val channelId = "casio_gate_channel"
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                channelId,
+                "Casio Gate — traitement audio",
+                NotificationManager.IMPORTANCE_LOW
+            )
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            manager.createNotificationChannel(channel)
+        }
+
+        val pendingIntent = PendingIntent.getActivity(
+            this, 0,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE
+        )
+
+        return NotificationCompat.Builder(this, channelId)
+            .setContentTitle("Casio Gate actif")
+            .setContentText("Le traitement audio continue en arrière-plan")
+            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setContentIntent(pendingIntent)
+            .setOngoing(true)
+            .build()
+    }
+
+    override fun onDestroy() {
+        releaseWakeLock()
+        engine.stop()
+        super.onDestroy()
+    }
+
+    companion object {
+        private const val NOTIFICATION_ID = 1
+    }
+}
+
 class MainActivity : ComponentActivity() {
 
-    private val gateEngine by lazy { GateEngine(applicationContext) }
+    private var boundService: GateForegroundService? = null
+    private var isBound by mutableStateOf(false)
+
+    private val connection = object : android.content.ServiceConnection {
+        override fun onServiceConnected(name: android.content.ComponentName?, service: IBinder?) {
+            val binder = service as GateForegroundService.LocalBinder
+            boundService = binder.getService()
+            boundService?.engine?.micPermissionGranted =
+                ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.RECORD_AUDIO) ==
+                PackageManager.PERMISSION_GRANTED
+            isBound = true
+        }
+
+        override fun onServiceDisconnected(name: android.content.ComponentName?) {
+            isBound = false
+            boundService = null
+        }
+    }
 
     private val requestMicPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
-        gateEngine.micPermissionGranted = granted
+        boundService?.engine?.micPermissionGranted = granted
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -64,21 +184,45 @@ class MainActivity : ComponentActivity() {
             != PackageManager.PERMISSION_GRANTED
         ) {
             requestMicPermission.launch(Manifest.permission.RECORD_AUDIO)
-        } else {
-            gateEngine.micPermissionGranted = true
         }
 
+        val serviceIntent = Intent(this, GateForegroundService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(serviceIntent)
+        } else {
+            startService(serviceIntent)
+        }
+        bindService(serviceIntent, connection, Context.BIND_AUTO_CREATE)
+
         setContent {
-            CasioGateScreen(gateEngine)
+            if (isBound) {
+                boundService?.engine?.let { engine ->
+                    CasioGateScreen(engine)
+                }
+            } else {
+                // Écran de chargement minimal pendant la connexion au service
+                Box(
+                    modifier = Modifier.fillMaxSize().background(Color.Black),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text("Chargement…", color = Color.White)
+                }
+            }
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        gateEngine.stop()
+        // Le service continue de tourner (foreground + START_STICKY) même
+        // après unbind, tant que l'utilisateur ne l'arrête pas
+        // explicitement — c'est ce qui permet au son de continuer écran
+        // éteint. On délie juste la connexion UI.
+        if (isBound) {
+            unbindService(connection)
+            isBound = false
+        }
     }
 }
-
 enum class InputSource {
     MIC,
     USB_LINE
@@ -264,14 +408,19 @@ class GateEngine(private val context: android.content.Context) {
     /** Liste les entrées audio actuellement disponibles (jack, micro intégré, USB...). */
     fun availableInputDevices(): List<AudioDeviceInfo> {
         val audioManager = context.getSystemService(android.content.Context.AUDIO_SERVICE) as AudioManager
+        // Liste noire plutôt que blanche : on exclut seulement ce qui
+        // n'a clairement aucun sens comme source audio (télé, remote
+        // submix réservé au système, FM tuner...), pour être sûr de ne
+        // jamais filtrer par erreur un device USB au type inattendu
+        // (ex: TYPE_USB_ACCESSORY, TYPE_DOCK, etc.).
+        val excludedTypes = setOf(
+            AudioDeviceInfo.TYPE_TELEPHONY,
+            AudioDeviceInfo.TYPE_REMOTE_SUBMIX,
+            AudioDeviceInfo.TYPE_FM_TUNER,
+            AudioDeviceInfo.TYPE_TV_TUNER
+        )
         return audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
-            .filter { device ->
-                device.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
-                device.type == AudioDeviceInfo.TYPE_USB_DEVICE ||
-                device.type == AudioDeviceInfo.TYPE_USB_HEADSET ||
-                device.type == AudioDeviceInfo.TYPE_BUILTIN_MIC ||
-                device.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
-            }
+            .filter { it.type !in excludedTypes }
             // Android expose parfois le même device physique deux fois
             // (ex: deux entrées TYPE_BUILTIN_MIC). On ne garde qu'une
             // entrée par type pour un affichage propre.
@@ -280,10 +429,15 @@ class GateEngine(private val context: android.content.Context) {
 
     fun inputDeviceLabel(device: AudioDeviceInfo): String = when (device.type) {
         AudioDeviceInfo.TYPE_WIRED_HEADSET -> "Jack (entrée filaire)"
-        AudioDeviceInfo.TYPE_USB_DEVICE, AudioDeviceInfo.TYPE_USB_HEADSET -> "USB-C"
+        AudioDeviceInfo.TYPE_USB_DEVICE -> "USB-C"
+        AudioDeviceInfo.TYPE_USB_HEADSET -> "USB-C (headset)"
+        AudioDeviceInfo.TYPE_USB_ACCESSORY -> "USB-C (accessoire)"
         AudioDeviceInfo.TYPE_BUILTIN_MIC -> "Micro intégré"
         AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "Bluetooth"
-        else -> "Autre"
+        AudioDeviceInfo.TYPE_DOCK -> "Dock"
+        // Fallback : affiche le code type brut plutôt qu'"Autre" muet,
+        // pour pouvoir identifier un type de device non prévu.
+        else -> "Autre (type ${device.type})"
     }
 
     // --- Tap tempo (secours manuel) ---
@@ -444,6 +598,82 @@ class GateEngine(private val context: android.content.Context) {
     private var stutterReadPos = 0
     private var lastStutterStepIdx = -1
 
+    // --- Presets (3 mémoires, pour rappel rapide en live) ---
+    // Capture tous les paramètres modifiables de l'appli en un seul
+    // instantané immuable.
+    private data class PresetSnapshot(
+        val pattern: List<StepConfig>,
+        val stepCount: Int,
+        val bpm: Int,
+        val stepSubdivision: Float,
+        val gateWidth: Float,
+        val fadeMs: Float,
+        val outputGain: Float,
+        val filterEnabled: Boolean,
+        val filterType: FilterType,
+        val filterCutoffHz: Float,
+        val wetDryMix: Float,
+        val crushBitDepthEnabled: Boolean,
+        val crushBitDepth: Float,
+        val crushSampleRateEnabled: Boolean,
+        val crushSampleRateDivider: Float,
+        val stutterFragmentMs: Float
+    )
+
+    // 3 emplacements, null tant qu'aucun preset n'a été sauvegardé.
+    private val presetSlots = arrayOfNulls<PresetSnapshot>(3)
+    // Expose à l'UI quels slots sont occupés (pour un indicateur visuel).
+    val presetOccupied = mutableStateListOf(false, false, false)
+
+    /** Sauvegarde l'état actuel complet dans le slot indiqué (0, 1 ou 2). */
+    fun savePreset(slot: Int) {
+        if (slot !in 0..2) return
+        presetSlots[slot] = PresetSnapshot(
+            pattern = pattern.toList(),
+            stepCount = stepCount,
+            bpm = bpm,
+            stepSubdivision = stepSubdivision,
+            gateWidth = gateWidth,
+            fadeMs = fadeMs,
+            outputGain = outputGain,
+            filterEnabled = filterEnabled,
+            filterType = filterType,
+            filterCutoffHz = filterCutoffHz,
+            wetDryMix = wetDryMix,
+            crushBitDepthEnabled = crushBitDepthEnabled,
+            crushBitDepth = crushBitDepth,
+            crushSampleRateEnabled = crushSampleRateEnabled,
+            crushSampleRateDivider = crushSampleRateDivider,
+            stutterFragmentMs = stutterFragmentMs
+        )
+        presetOccupied[slot] = true
+    }
+
+    /** Recharge l'état complet depuis le slot indiqué, si occupé. */
+    fun loadPreset(slot: Int) {
+        if (slot !in 0..2) return
+        val snap = presetSlots[slot] ?: return
+        pushHistory()
+
+        stepCount = snap.stepCount
+        pattern.clear()
+        pattern.addAll(snap.pattern)
+
+        bpm = snap.bpm
+        stepSubdivision = snap.stepSubdivision
+        gateWidth = snap.gateWidth
+        fadeMs = snap.fadeMs
+        outputGain = snap.outputGain
+        filterEnabled = snap.filterEnabled
+        filterType = snap.filterType
+        filterCutoffHz = snap.filterCutoffHz
+        wetDryMix = snap.wetDryMix
+        crushBitDepthEnabled = snap.crushBitDepthEnabled
+        crushBitDepth = snap.crushBitDepth
+        crushSampleRateEnabled = snap.crushSampleRateEnabled
+        crushSampleRateDivider = snap.crushSampleRateDivider
+        stutterFragmentMs = snap.stutterFragmentMs
+    }
 
     @Volatile
     private var running = false
@@ -474,10 +704,17 @@ class GateEngine(private val context: android.content.Context) {
         pattern[index] = current.copy(mode = nextMode)
     }
 
+    // Callbacks optionnels vers le Service hébergeant ce moteur, pour
+    // acquérir/libérer le WakeLock au bon moment (pendant la lecture
+    // seulement, pour ne pas garder le CPU éveillé inutilement).
+    var onStartPlayback: (() -> Unit)? = null
+    var onStopPlayback: (() -> Unit)? = null
+
     fun start() {
         if (running) return
         if (!micPermissionGranted) return
         running = true
+        onStartPlayback?.invoke()
         audioThread = Thread { runAudioLoop() }
         audioThread?.start()
     }
@@ -486,6 +723,7 @@ class GateEngine(private val context: android.content.Context) {
         running = false
         audioThread?.join(500)
         audioThread = null
+        onStopPlayback?.invoke()
     }
 
     @Suppress("MissingPermission")
@@ -982,6 +1220,39 @@ fun CasioGateScreen(engine: GateEngine) {
                     contentPadding = PaddingValues(4.dp)
                 ) {
                     Text("Undo", fontSize = 11.sp)
+                }
+            }
+
+            Spacer(Modifier.height(8.dp))
+
+            Text(
+                "Presets (appui court : charger, appui long : sauver)",
+                color = Color.Gray,
+                fontSize = 9.sp
+            )
+            Row(modifier = Modifier.fillMaxWidth()) {
+                for (slot in 0..2) {
+                    val occupied = engine.presetOccupied[slot]
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(horizontal = 2.dp)
+                            .background(if (occupied) Color(0xFF2A4D2A) else Color.DarkGray)
+                            .pointerInput(slot) {
+                                detectTapGestures(
+                                    onTap = { engine.loadPreset(slot) },
+                                    onLongPress = { engine.savePreset(slot) }
+                                )
+                            }
+                            .padding(vertical = 10.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            "P${slot + 1}",
+                            color = if (occupied) Color.Green else Color.LightGray,
+                            fontSize = 12.sp
+                        )
+                    }
                 }
             }
 
