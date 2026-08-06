@@ -1372,15 +1372,29 @@ fun LfoPanel(engine: GateEngine, expanded: Boolean, onToggleExpanded: () -> Unit
 
             // Fader générique 2 : Vitesse — partagée par tous les
             // paramètres puisqu'il n'y a qu'un seul moteur LFO.
+            // Échelle logarithmique : le slider manipule une position
+            // 0..1 convertie en Hz par une exponentielle, ce qui donne
+            // beaucoup plus de résolution sur la zone musicalement utile
+            // (0.01 à 3 Hz) que sur la zone rapide (3 à 20 Hz), au lieu
+            // d'un étalement linéaire qui écraserait la zone lente.
             Text(
                 "Vitesse : ${"%.2f".format(engine.lfo.speedHz)} Hz",
                 color = Color.White,
                 fontSize = 11.sp
             )
+            val minHz = 0.01f
+            val maxHz = 20f
+            val logMin = ln(minHz)
+            val logMax = ln(maxHz)
+            val sliderPos = ((ln(engine.lfo.speedHz.coerceIn(minHz, maxHz)) - logMin) / (logMax - logMin))
+                .coerceIn(0f, 1f)
             Slider(
-                value = engine.lfo.speedHz,
-                onValueChange = { engine.lfo.speedHz = it },
-                valueRange = 0.01f..20f
+                value = sliderPos,
+                onValueChange = { pos ->
+                    val hz = exp(logMin + pos * (logMax - logMin))
+                    engine.lfo.speedHz = hz.coerceIn(minHz, maxHz)
+                },
+                valueRange = 0f..1f
             )
         }
     }
