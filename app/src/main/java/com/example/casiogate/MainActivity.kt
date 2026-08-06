@@ -43,6 +43,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import kotlin.math.*
 
 /**
  * CASIO GATE v3
@@ -233,6 +234,72 @@ enum class FilterType {
     HIGHPASS
 }
 
+enum class LfoWaveform {
+    SINE,
+    TRIANGLE,
+    SQUARE,
+    RANDOM // sample & hold
+}
+
+/**
+ * Identifie chaque paramètre modulable par le LFO. Un seul moteur LFO
+ * global (une phase, une forme d'onde, une vitesse) pilote tous les
+ * paramètres qui ont leur case "Mod" cochée — chacun garde sa propre
+ * amplitude (ex: ±5 BPM vs ±20% gate width), mais partage la même
+ * oscillation de base.
+ */
+enum class ModTarget {
+    BPM, GATE_WIDTH, FADE, BIT_DEPTH, SAMPLE_RATE, STUTTER
+}
+
+/**
+ * Calcule la valeur d'oscillation du LFO (entre -1.0 et +1.0) à un
+ * instant donné, selon la forme d'onde choisie. C'est un seul moteur
+ * partagé — chaque paramètre modulé multiplie ensuite cette valeur par
+ * sa propre amplitude pour obtenir son offset réel.
+ */
+class LfoEngine {
+    var waveform by mutableStateOf(LfoWaveform.SINE)
+    // Vitesse en Hz : 0.01 (très lent, plusieurs dizaines de secondes
+    // par cycle) à 20 Hz (rapide, quasi-audible en modulation).
+    var speedHz by mutableStateOf(0.5f)
+
+    private var phase = 0.0 // 0.0 à 1.0, position dans le cycle
+    private var lastRandomValue = 0.0
+    private var lastRandomPhaseBucket = -1
+
+    /**
+     * Avance la phase du LFO de deltaSeconds, et retourne la valeur
+     * d'oscillation actuelle (-1.0 à +1.0). À appeler une fois par
+     * buffer audio traité, avec le temps réellement écoulé.
+     */
+    fun advance(deltaSeconds: Double): Double {
+        phase += deltaSeconds * speedHz
+        phase -= floor(phase) // garde phase dans [0, 1)
+
+        return when (waveform) {
+            LfoWaveform.SINE -> sin(2.0 * PI * phase)
+            LfoWaveform.TRIANGLE -> {
+                // Triangle : monte de -1 à 1 sur la première moitié du
+                // cycle, redescend sur la seconde.
+                if (phase < 0.5) (phase * 4.0) - 1.0
+                else 3.0 - (phase * 4.0)
+            }
+            LfoWaveform.SQUARE -> if (phase < 0.5) 1.0 else -1.0
+            LfoWaveform.RANDOM -> {
+                // Sample & hold : tire une nouvelle valeur aléatoire à
+                // chaque nouveau cycle, la garde fixe sur tout le cycle.
+                val bucket = (phase * 8).toInt() // 8 valeurs tenues par cycle, pour un rendu plus rythmique que juste 1/cycle
+                if (bucket != lastRandomPhaseBucket) {
+                    lastRandomValue = kotlin.random.Random.nextDouble(-1.0, 1.0)
+                    lastRandomPhaseBucket = bucket
+                }
+                lastRandomValue
+            }
+        }
+    }
+}
+
 /**
  * Représente l'état d'un step, avec 3 possibilités :
  * - fermé (silence)
@@ -306,6 +373,95 @@ object DnbPatterns {
 }
 
 class GateEngine(private val context: android.content.Context) {
+
+    // ============================================================
+    // MOTEUR DE MODULATION LFO
+    // ============================================================
+    // Un seul LFO global, dont la sortie (-1.0 à +1.0) est appliquée à
+    // tous les paramètres qui ont leur modulation activée. Chaque
+    // paramètre modulable garde sa valeur de base (celle du slider) et
+    // une amplitude propre (ex: ±5 BPM, ±20%) — c'est cette combinaison
+    // qui donne la valeur finale utilisée par le moteur audio.
+
+    enum class LfoWaveform { SINE, TRIANGLE, SQUARE, RANDOM }
+
+    var lfoWaveform by mutableStateOf(LfoWaveform.SINE)
+    // Vitesse du LFO en Hz (cycles par seconde). 0.01 = très lent
+    // (un cycle toutes les 100s), 20 = très rapide (quasi audio-rate).
+    var lfoSpeedHz by mutableStateOf(0.5f)
+
+    // Phase courante du LFO, avance à chaque buffer audio traité.
+    private var lfoPhase = 0.0
+    // Dernière valeur tirée pour le mode RANDOM (sample & hold), changée
+    // une fois par cycle plutôt qu'en continu.
+    private var lfoRandomValue = 0.0
+    private var lfoRandomCycleIndex = -1L
+
+    /**
+     * Calcule la sortie LFO courante (-1.0 à +1.0) selon la forme
+     * d'onde choisie, à partir de la phase actuelle (0.0 à 1.0).
+     */
+    private fun lfoOutput(): Double {
+        val phase = lfoPhase % 1.0
+        return when (lfoWaveform) {
+            LfoWaveform.SINE -> sin(2.0 * Math.PI * phase)
+            LfoWaveform.TRIANGLE -> {
+                // Triangle symétrique : monte de -1 à 1 sur la 1ère moitié,
+                // redescend sur la 2ème.
+                if (phase < 0.5) (phase * 4.0) - 1.0
+                else 3.0 - (phase * 4.0)
+            }
+            LfoWaveform.SQUARE -> if (phase < 0.5) 1.0 else -1.0
+            LfoWaveform.RANDOM -> {
+                // Sample & hold : une nouvelle valeur aléatoire tirée une
+                // fois par cycle complet, maintenue tout le cycle.
+                val cycleIndex = lfoPhase.toLong()
+                if (cycleIndex != lfoRandomCycleIndex) {
+                    lfoRandomValue = kotlin.random.Random.nextDouble(-1.0, 1.0)
+                    lfoRandomCycleIndex = cycleIndex
+                }
+                lfoRandomValue
+            }
+        }
+    }
+
+    /** Avance la phase du LFO d'un buffer audio, selon sa durée réelle en secondes. */
+    private fun advanceLfo(bufferDurationSeconds: Double) {
+        lfoPhase += lfoSpeedHz * bufferDurationSeconds
+        if (lfoPhase > 1_000_000.0) lfoPhase %= 1.0 // évite une dérive numérique sur très longue session
+    }
+
+    // --- Activation de la modulation par paramètre ---
+    // Chaque booléen active/désactive la modulation pour ce paramètre
+    // précis. La valeur de base reste celle du slider habituel — la
+    // modulation vient s'ajouter par-dessus au moment du rendu audio.
+    var modBpmEnabled by mutableStateOf(false)
+    var modGateWidthEnabled by mutableStateOf(false)
+    var modFadeEnabled by mutableStateOf(false)
+    var modBitCrushEnabled by mutableStateOf(false)
+    var modSampleCrushEnabled by mutableStateOf(false)
+    var modStutterEnabled by mutableStateOf(false)
+
+    // --- Amplitude de modulation par paramètre (unité propre à chacun) ---
+    var modBpmAmplitude by mutableStateOf(15f)          // +/- BPM
+    var modGateWidthAmplitude by mutableStateOf(0.2f)   // +/- proportion (0..1)
+    var modFadeAmplitude by mutableStateOf(5f)           // +/- ms
+    var modBitCrushAmplitude by mutableStateOf(4f)       // +/- bits
+    var modSampleCrushAmplitude by mutableStateOf(8f)    // +/- diviseur
+    var modStutterAmplitude by mutableStateOf(20f)       // +/- ms
+
+    /** Applique la modulation LFO à une valeur de base, si activée, avec bornage. */
+    private fun modulate(
+        enabled: Boolean,
+        base: Double,
+        amplitude: Double,
+        lfoValue: Double,
+        min: Double,
+        max: Double
+    ): Double {
+        if (!enabled) return base
+        return (base + lfoValue * amplitude).coerceIn(min, max)
+    }
 
     // Device de sortie forcé (ex: Bluetooth), indépendant de ce qui est
     // branché en entrée sur le jack. null = comportement par défaut du
@@ -675,6 +831,40 @@ class GateEngine(private val context: android.content.Context) {
         stutterFragmentMs = snap.stutterFragmentMs
     }
 
+    // --- LFO / Modulation ---
+    // Un seul moteur LFO partagé (phase, forme d'onde, vitesse communes
+    // à tous les paramètres modulés).
+    val lfo = LfoEngine()
+
+    // Quels paramètres sont actuellement modulés (case "Mod" cochée).
+    val modEnabled = mutableStateMapOf<ModTarget, Boolean>().apply {
+        ModTarget.values().forEach { this[it] = false }
+    }
+
+    // Amplitude de modulation par paramètre, dans l'unité propre à
+    // chaque paramètre (BPM en battements, gate width en proportion
+    // 0-1, etc.) — c'est le rayon de la plage : valeur finale oscille
+    // entre (base - amplitude) et (base + amplitude).
+    var modAmplitudeBpm by mutableStateOf(5f)          // ±5 BPM par défaut
+    var modAmplitudeGateWidth by mutableStateOf(0.15f) // ±15%
+    var modAmplitudeFade by mutableStateOf(2f)          // ±2 ms
+    var modAmplitudeBitDepth by mutableStateOf(3f)      // ±3 bits
+    var modAmplitudeSampleRate by mutableStateOf(8f)    // ±8 (divider)
+    var modAmplitudeStutter by mutableStateOf(15f)      // ±15 ms
+
+    /**
+     * Calcule la valeur effective d'un paramètre modulable : sa valeur
+     * de base (ce que montre le slider) si non modulé, ou base +
+     * (oscillation LFO × amplitude propre) si modulé. lfoValue doit
+     * être la valeur -1..1 déjà calculée par lfo.advance() pour ce
+     * buffer — partagée entre tous les paramètres pour qu'ils oscillent
+     * en phase les uns avec les autres.
+     */
+    private fun modulated(target: ModTarget, base: Float, lfoValue: Double, amplitude: Float): Float {
+        if (modEnabled[target] != true) return base
+        return (base + lfoValue * amplitude).toFloat()
+    }
+
     @Volatile
     private var running = false
     private var audioThread: Thread? = null
@@ -857,14 +1047,29 @@ class GateEngine(private val context: android.content.Context) {
             // tempo, si activée — ne modifie pas le buffer.
             analyzeForTempo(monoBuffer, read, sampleRate)
 
+            // Avance le LFO du temps réellement écoulé pour ce buffer,
+            // et récupère sa valeur d'oscillation actuelle (-1..1),
+            // partagée par tous les paramètres modulés pour qu'ils
+            // oscillent en phase entre eux.
+            val bufferDurationSeconds = read.toDouble() / sampleRate
+            val lfoValue = lfo.advance(bufferDurationSeconds)
+
+            // BPM effectif pour ce buffer : modulé si sa case "Mod" est
+            // cochée, sinon la valeur brute du slider.
+            val effectiveBpm = modulated(ModTarget.BPM, bpm.toFloat(), lfoValue, modAmplitudeBpm)
+                .coerceIn(20f, 300f)
+
             // Durée d'un step en échantillons, identique pour tous les
-            // steps, dérivée du BPM et de la subdivision choisie.
-            val stepSamples = (sampleRate * 60.0 / bpm * stepSubdivision)
+            // steps, dérivée du BPM (modulé ou non) et de la subdivision.
+            val stepSamples = (sampleRate * 60.0 / effectiveBpm * stepSubdivision)
                 .toLong().coerceAtLeast(1)
 
             // Fondu anti-clic, recalculé à chaque buffer pour rester
-            // réactif si l'utilisateur ajuste fadeMs en cours de lecture.
-            val fadeSamples = (sampleRate * fadeMs / 1000.0).toInt().coerceAtLeast(1)
+            // réactif si l'utilisateur ajuste fadeMs en cours de lecture,
+            // ou si fadeMs est modulé par le LFO.
+            val effectiveFadeMs = modulated(ModTarget.FADE, fadeMs, lfoValue, modAmplitudeFade)
+                .coerceIn(0.5f, 30f)
+            val fadeSamples = (sampleRate * effectiveFadeMs / 1000.0).toInt().coerceAtLeast(1)
 
             val patternLen = pattern.size.coerceAtLeast(1)
 
@@ -891,7 +1096,10 @@ class GateEngine(private val context: android.content.Context) {
                 var sourceSample = monoBuffer[i]
 
                 if (step.mode == StepMode.STUTTER) {
-                    val fragmentSamples = (sampleRate * stutterFragmentMs / 1000.0)
+                    val effectiveStutterMs = modulated(
+                        ModTarget.STUTTER, stutterFragmentMs, lfoValue, modAmplitudeStutter
+                    ).coerceIn(5f, 200f)
+                    val fragmentSamples = (sampleRate * effectiveStutterMs / 1000.0)
                         .toInt().coerceIn(8, stepSamples.toInt().coerceAtLeast(8))
 
                     // Nouveau step stutter : on (re)capture le fragment
@@ -926,10 +1134,14 @@ class GateEngine(private val context: android.content.Context) {
                 }
 
                 // Durée pendant laquelle le son reste audible à l'intérieur
-                // de ce step, déterminée par gateWidth. Le step dans son
-                // ensemble (stepSamples) ne change jamais : seul ce sous-
-                // segment interne bouge, donc le tempo reste intact.
-                val audibleSamples = (stepSamples * gateWidth)
+                // de ce step, déterminée par gateWidth (modulé ou non).
+                // Le step dans son ensemble (stepSamples) ne change
+                // jamais : seul ce sous-segment interne bouge, donc le
+                // tempo reste intact.
+                val effectiveGateWidth = modulated(
+                    ModTarget.GATE_WIDTH, gateWidth, lfoValue, modAmplitudeGateWidth
+                ).coerceIn(0.05f, 1.0f)
+                val audibleSamples = (stepSamples * effectiveGateWidth)
                     .toLong().coerceIn(1, stepSamples)
 
                 val isInAudiblePortion = posInCurrentStep < audibleSamples
@@ -965,20 +1177,27 @@ class GateEngine(private val context: android.content.Context) {
 
                 // --- Bitcrush : réduction de sample rate (sample & hold)
                 // puis réduction de bit depth (quantification), appliqués
-                // uniquement au signal wet.
+                // uniquement au signal wet. Les deux paramètres peuvent
+                // être modulés par le LFO indépendamment de leur toggle
+                // ON/OFF (la modulation n'a d'effet que si le crush est
+                // déjà activé).
                 if (crushSampleRateEnabled) {
-                    val divider = crushSampleRateDivider.toInt().coerceAtLeast(1)
+                    val effectiveDivider = modulated(
+                        ModTarget.SAMPLE_RATE, crushSampleRateDivider, lfoValue, modAmplitudeSampleRate
+                    ).toInt().coerceIn(1, 64)
                     if (crushHoldCounter <= 0) {
                         crushHoldSample = wetSample.toInt().toShort()
-                        crushHoldCounter = divider
+                        crushHoldCounter = effectiveDivider
                     }
                     wetSample = crushHoldSample.toDouble()
                     crushHoldCounter--
                 }
 
                 if (crushBitDepthEnabled) {
-                    val bits = crushBitDepth.toInt().coerceIn(1, 16)
-                    val levels = (1 shl bits) // nombre de niveaux d'amplitude possibles
+                    val effectiveBits = modulated(
+                        ModTarget.BIT_DEPTH, crushBitDepth, lfoValue, modAmplitudeBitDepth
+                    ).toInt().coerceIn(1, 16)
+                    val levels = (1 shl effectiveBits) // nombre de niveaux d'amplitude possibles
                     val step2 = 65536.0 / levels
                     wetSample = (Math.round(wetSample / step2) * step2)
                 }
@@ -1013,10 +1232,165 @@ class GateEngine(private val context: android.content.Context) {
     }
 }
 
+/**
+ * Panneau de modulation LFO, en haut de page. Replié : juste un bandeau
+ * avec les 6 boutons "Mod" compacts par paramètre (vert = actif). Déplié :
+ * ajoute la forme d'onde, et deux faders génériques — Amplitude (celle
+ * du DERNIER paramètre modulé activé/touché) et Vitesse (partagée par
+ * tous, puisque c'est un seul moteur LFO).
+ */
+@Composable
+fun LfoPanel(engine: GateEngine, expanded: Boolean, onToggleExpanded: () -> Unit) {
+
+    // Le paramètre actuellement "sélectionné" pour éditer son amplitude
+    // dans le fader généraliste — par défaut le premier activé, sinon BPM.
+    var selectedTarget by remember { mutableStateOf(ModTarget.BPM) }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Color(0xFF151515))
+            .padding(8.dp)
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("LFO", color = Color.Magenta, fontSize = 13.sp)
+            Spacer(Modifier.width(12.dp))
+
+            // Un bouton compact par paramètre modulable — vert si actif.
+            ModTarget.values().forEach { target ->
+                val isOn = engine.modEnabled[target] == true
+                val label = when (target) {
+                    ModTarget.BPM -> "BPM"
+                    ModTarget.GATE_WIDTH -> "Gate"
+                    ModTarget.FADE -> "Fade"
+                    ModTarget.BIT_DEPTH -> "Bit"
+                    ModTarget.SAMPLE_RATE -> "Sample"
+                    ModTarget.STUTTER -> "Stutter"
+                }
+                Box(
+                    modifier = Modifier
+                        .padding(horizontal = 2.dp)
+                        .background(if (isOn) Color(0xFF2A6E2A) else Color.DarkGray)
+                        .clickable {
+                            engine.modEnabled[target] = !isOn
+                            selectedTarget = target
+                        }
+                        .padding(horizontal = 8.dp, vertical = 6.dp)
+                ) {
+                    Text(label, color = if (isOn) Color.Green else Color.LightGray, fontSize = 10.sp)
+                }
+            }
+
+            Spacer(Modifier.weight(1f))
+
+            TextButton(onClick = onToggleExpanded) {
+                Text(if (expanded) "▲" else "▼", color = Color.White, fontSize = 12.sp)
+            }
+        }
+
+        if (expanded) {
+            Spacer(Modifier.height(8.dp))
+
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Forme :", color = Color.White, fontSize = 11.sp)
+                Spacer(Modifier.width(6.dp))
+                LfoWaveform.values().forEach { wf ->
+                    val label = when (wf) {
+                        LfoWaveform.SINE -> "Sinus"
+                        LfoWaveform.TRIANGLE -> "Triangle"
+                        LfoWaveform.SQUARE -> "Carré"
+                        LfoWaveform.RANDOM -> "Random"
+                    }
+                    FilterChip(
+                        selected = engine.lfo.waveform == wf,
+                        onClick = { engine.lfo.waveform = wf },
+                        label = { Text(label, fontSize = 10.sp) },
+                        modifier = Modifier.padding(horizontal = 2.dp)
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(8.dp))
+
+            // Fader générique 1 : Amplitude du paramètre sélectionné
+            // (celui du dernier bouton "Mod" activé/touché).
+            val (ampValue, ampSetter, ampLabel, ampRange) = when (selectedTarget) {
+                ModTarget.BPM -> AmplitudeControl(
+                    engine.modAmplitudeBpm, { engine.modAmplitudeBpm = it }, "± BPM", 0f..30f
+                )
+                ModTarget.GATE_WIDTH -> AmplitudeControl(
+                    engine.modAmplitudeGateWidth, { engine.modAmplitudeGateWidth = it }, "± Gate width", 0f..0.5f
+                )
+                ModTarget.FADE -> AmplitudeControl(
+                    engine.modAmplitudeFade, { engine.modAmplitudeFade = it }, "± Fade (ms)", 0f..15f
+                )
+                ModTarget.BIT_DEPTH -> AmplitudeControl(
+                    engine.modAmplitudeBitDepth, { engine.modAmplitudeBitDepth = it }, "± Bits", 0f..8f
+                )
+                ModTarget.SAMPLE_RATE -> AmplitudeControl(
+                    engine.modAmplitudeSampleRate, { engine.modAmplitudeSampleRate = it }, "± Sample div", 0f..32f
+                )
+                ModTarget.STUTTER -> AmplitudeControl(
+                    engine.modAmplitudeStutter, { engine.modAmplitudeStutter = it }, "± Stutter (ms)", 0f..100f
+                )
+            }
+
+            Text(
+                "Amplitude (${selectedTarget.name}) : ${ampLabel(ampValue)}",
+                color = Color.White,
+                fontSize = 11.sp
+            )
+            Slider(
+                value = ampValue,
+                onValueChange = ampSetter,
+                valueRange = ampRange
+            )
+
+            Spacer(Modifier.height(6.dp))
+
+            // Fader générique 2 : Vitesse — partagée par tous les
+            // paramètres puisqu'il n'y a qu'un seul moteur LFO.
+            Text(
+                "Vitesse : ${"%.2f".format(engine.lfo.speedHz)} Hz",
+                color = Color.White,
+                fontSize = 11.sp
+            )
+            Slider(
+                value = engine.lfo.speedHz,
+                onValueChange = { engine.lfo.speedHz = it },
+                valueRange = 0.01f..20f
+            )
+        }
+    }
+}
+
+/** Petit conteneur pour retourner (valeur, setter, formateur, plage) ensemble. */
+private data class AmplitudeControl(
+    val value: Float,
+    val setter: (Float) -> Unit,
+    val formatter: (Float) -> String,
+    val range: ClosedFloatingPointRange<Float>
+)
+
+private fun AmplitudeControl(
+    value: Float,
+    setter: (Float) -> Unit,
+    unitLabel: String,
+    range: ClosedFloatingPointRange<Float>
+): AmplitudeControl = AmplitudeControl(
+    value, setter,
+    { v -> "%.2f %s".format(v, unitLabel) },
+    range
+)
+
 @Composable
 fun CasioGateScreen(engine: GateEngine) {
 
     var playing by remember { mutableStateOf(false) }
+    var lfoPanelExpanded by remember { mutableStateOf(false) }
 
     BoxWithConstraints(
         modifier = Modifier
@@ -1033,11 +1407,23 @@ fun CasioGateScreen(engine: GateEngine) {
         val stepCellSize = (maxWidth * 0.06f).coerceIn(40.dp, 80.dp)
         val basePadding = (maxWidth * 0.01f).coerceIn(8.dp, 20.dp)
 
-        Row(
+        Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(basePadding)
         ) {
+
+            // --- Panneau LFO, en haut de page, replié par défaut pour
+            // économiser de la place. Un seul moteur LFO global : quand
+            // déplié, il affiche la forme d'onde, la vitesse, et un
+            // bouton "Mod" compact par paramètre modulable.
+            LfoPanel(engine, lfoPanelExpanded, onToggleExpanded = { lfoPanelExpanded = !lfoPanelExpanded })
+
+            Spacer(Modifier.height(8.dp))
+
+            Row(
+                modifier = Modifier.fillMaxSize()
+            ) {
 
         // Colonne de gauche : contrôles (scrollable pour rester accessible
         // même en paysage sur un écran bas)
@@ -1436,5 +1822,7 @@ fun CasioGateScreen(engine: GateEngine) {
             }
         }
         }
+        }
     }
+}
 }
