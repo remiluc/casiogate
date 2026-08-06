@@ -1825,4 +1825,3 @@ fun CasioGateScreen(engine: GateEngine) {
         }
     }
 }
-}
