@@ -34,6 +34,8 @@ import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsDraggedAsState
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -836,6 +838,12 @@ class GateEngine(private val context: android.content.Context) {
     // à tous les paramètres modulés).
     val lfo = LfoEngine()
 
+    // Valeur d'oscillation courante du LFO (-1.0 à +1.0), mise à jour à
+    // chaque buffer audio traité — exposée en mutableState pour que
+    // l'UI puisse animer les sliders modulés en temps réel.
+    var currentLfoValue by mutableStateOf(0.0)
+        private set
+
     // Quels paramètres sont actuellement modulés (case "Mod" cochée).
     val modEnabled = mutableStateMapOf<ModTarget, Boolean>().apply {
         ModTarget.values().forEach { this[it] = false }
@@ -868,6 +876,7 @@ class GateEngine(private val context: android.content.Context) {
     @Volatile
     private var running = false
     private var audioThread: Thread? = null
+    private var lastUiPublishMs = 0L
 
     fun changeStepCount(newCount: Int) {
         val clamped = newCount.coerceIn(2, 32)
@@ -1053,6 +1062,16 @@ class GateEngine(private val context: android.content.Context) {
             // oscillent en phase entre eux.
             val bufferDurationSeconds = read.toDouble() / sampleRate
             val lfoValue = lfo.advance(bufferDurationSeconds)
+
+            // Publie la valeur vers l'UI au maximum ~30 fois/seconde —
+            // largement suffisant visuellement, et évite de saturer
+            // Compose avec des recompositions à la fréquence du buffer
+            // audio (qui peut être bien plus rapide).
+            val nowMs = System.currentTimeMillis()
+            if (nowMs - lastUiPublishMs >= 33) {
+                currentLfoValue = lfoValue
+                lastUiPublishMs = nowMs
+            }
 
             // BPM effectif pour ce buffer : modulé si sa case "Mod" est
             // cochée, sinon la valeur brute du slider.
@@ -1386,6 +1405,30 @@ private fun AmplitudeControl(
     range
 )
 
+/**
+ * Calcule la position visuelle d'un slider pour un paramètre modulable :
+ * sa valeur de base si non modulé, ou base + (LFO courant × amplitude)
+ * si modulé — pour que le curseur bouge visuellement en suivant le LFO,
+ * sans jamais modifier la valeur de base réellement stockée.
+ *
+ * Pendant que l'utilisateur touche activement le slider (isDragging),
+ * l'affichage se fige sur la valeur de base pure, modulation ignorée —
+ * pour qu'il règle la vraie base sans "capturer" une position parasitée
+ * par l'oscillation du LFO au moment du contact.
+ */
+@Composable
+fun visualSliderValue(
+    engine: GateEngine,
+    target: ModTarget,
+    base: Float,
+    amplitude: Float,
+    isDragging: Boolean
+): Float {
+    val isModulated = engine.modEnabled[target] == true
+    if (!isModulated || isDragging) return base
+    return (base + engine.currentLfoValue * amplitude).toFloat()
+}
+
 @Composable
 fun CasioGateScreen(engine: GateEngine) {
 
@@ -1439,10 +1482,14 @@ fun CasioGateScreen(engine: GateEngine) {
             Spacer(Modifier.height(12.dp))
 
             Text("BPM : ${engine.bpm}", color = Color.White, fontSize = 13.sp)
+            val bpmInteraction = remember { MutableInteractionSource() }
+            val bpmDragging by bpmInteraction.collectIsDraggedAsState()
             Slider(
-                value = engine.bpm.toFloat(),
+                value = visualSliderValue(engine, ModTarget.BPM, engine.bpm.toFloat(), engine.modAmplitudeBpm, bpmDragging)
+                    .coerceIn(40f, 220f),
                 onValueChange = { engine.bpm = it.toInt() },
-                valueRange = 40f..220f
+                valueRange = 40f..220f,
+                interactionSource = bpmInteraction
             )
 
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1487,10 +1534,14 @@ fun CasioGateScreen(engine: GateEngine) {
                 color = Color.White,
                 fontSize = 13.sp
             )
+            val gateInteraction = remember { MutableInteractionSource() }
+            val gateDragging by gateInteraction.collectIsDraggedAsState()
             Slider(
-                value = engine.gateWidth,
+                value = visualSliderValue(engine, ModTarget.GATE_WIDTH, engine.gateWidth, engine.modAmplitudeGateWidth, gateDragging)
+                    .coerceIn(0.05f, 1.0f),
                 onValueChange = { engine.gateWidth = it },
-                valueRange = 0.05f..1.0f
+                valueRange = 0.05f..1.0f,
+                interactionSource = gateInteraction
             )
 
             Spacer(Modifier.height(16.dp))
@@ -1502,10 +1553,14 @@ fun CasioGateScreen(engine: GateEngine) {
                 color = Color.White,
                 fontSize = 12.sp
             )
+            val fadeInteraction = remember { MutableInteractionSource() }
+            val fadeDragging by fadeInteraction.collectIsDraggedAsState()
             Slider(
-                value = engine.fadeMs,
+                value = visualSliderValue(engine, ModTarget.FADE, engine.fadeMs, engine.modAmplitudeFade, fadeDragging)
+                    .coerceIn(0.5f, 30f),
                 onValueChange = { engine.fadeMs = it },
-                valueRange = 0.5f..30f
+                valueRange = 0.5f..30f,
+                interactionSource = fadeInteraction
             )
 
             Spacer(Modifier.height(8.dp))
@@ -1732,10 +1787,14 @@ fun CasioGateScreen(engine: GateEngine) {
                     color = Color.White,
                     fontSize = 11.sp
                 )
+                val bitInteraction = remember { MutableInteractionSource() }
+                val bitDragging by bitInteraction.collectIsDraggedAsState()
                 Slider(
-                    value = engine.crushBitDepth,
+                    value = visualSliderValue(engine, ModTarget.BIT_DEPTH, engine.crushBitDepth, engine.modAmplitudeBitDepth, bitDragging)
+                        .coerceIn(1f, 16f),
                     onValueChange = { engine.crushBitDepth = it },
-                    valueRange = 1f..16f
+                    valueRange = 1f..16f,
+                    interactionSource = bitInteraction
                 )
             }
 
@@ -1757,10 +1816,14 @@ fun CasioGateScreen(engine: GateEngine) {
                     color = Color.White,
                     fontSize = 11.sp
                 )
+                val sampleInteraction = remember { MutableInteractionSource() }
+                val sampleDragging by sampleInteraction.collectIsDraggedAsState()
                 Slider(
-                    value = engine.crushSampleRateDivider,
+                    value = visualSliderValue(engine, ModTarget.SAMPLE_RATE, engine.crushSampleRateDivider, engine.modAmplitudeSampleRate, sampleDragging)
+                        .coerceIn(1f, 64f),
                     onValueChange = { engine.crushSampleRateDivider = it },
-                    valueRange = 1f..64f
+                    valueRange = 1f..64f,
+                    interactionSource = sampleInteraction
                 )
             }
 
@@ -1772,10 +1835,14 @@ fun CasioGateScreen(engine: GateEngine) {
                 color = Color.White,
                 fontSize = 12.sp
             )
+            val stutterInteraction = remember { MutableInteractionSource() }
+            val stutterDragging by stutterInteraction.collectIsDraggedAsState()
             Slider(
-                value = engine.stutterFragmentMs,
+                value = visualSliderValue(engine, ModTarget.STUTTER, engine.stutterFragmentMs, engine.modAmplitudeStutter, stutterDragging)
+                    .coerceIn(5f, 200f),
                 onValueChange = { engine.stutterFragmentMs = it },
-                valueRange = 5f..200f
+                valueRange = 5f..200f,
+                interactionSource = stutterInteraction
             )
             Text(
                 "Tap sur un step : fermé → ouvert → stutter → fermé",
