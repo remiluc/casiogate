@@ -329,6 +329,101 @@ data class StepConfig(
  * fermés) — s'applique en boucle même si stepCount n'est pas 16 (le
  * moteur répète/tronque selon le nombre de steps réglé).
  */
+object YiJingPatterns {
+
+    /**
+     * Les 64 hexagrammes du Yi King, en ordre King Wen traditionnel.
+     * lines[0] = trait du bas, lines[5] = trait du haut (ordre de lecture
+     * traditionnel bas -> haut). true = trait plein (yang), false = trait
+     * brisé (yin).
+     */
+    data class Hexagram(val number: Int, val name: String, val lines: List<Boolean>)
+
+    val all: List<Hexagram> = listOf(
+        Hexagram(1, "Qian - Le Créateur", listOf(true, true, true, true, true, true)),
+        Hexagram(2, "Kun - Le Réceptif", listOf(false, false, false, false, false, false)),
+        Hexagram(3, "Zhun - La Difficulté initiale", listOf(true, false, false, false, true, false)),
+        Hexagram(4, "Meng - La Folie juvénile", listOf(false, true, false, false, false, true)),
+        Hexagram(5, "Xu - L'Attente", listOf(true, true, true, false, true, false)),
+        Hexagram(6, "Song - Le Conflit", listOf(false, true, false, true, true, true)),
+        Hexagram(7, "Shi - L'Armée", listOf(false, true, false, false, false, false)),
+        Hexagram(8, "Bi - La Solidarité", listOf(false, false, false, false, true, false)),
+        Hexagram(9, "Xiao Chu - La Force apprivoisée du petit", listOf(true, true, true, false, true, true)),
+        Hexagram(10, "Lu - La Marche", listOf(true, true, false, true, true, true)),
+        Hexagram(11, "Tai - La Paix", listOf(true, true, true, false, false, false)),
+        Hexagram(12, "Pi - La Stagnation", listOf(false, false, false, true, true, true)),
+        Hexagram(13, "Tong Ren - La Communauté", listOf(true, false, true, true, true, true)),
+        Hexagram(14, "Da You - La Possession de grand", listOf(true, true, true, true, false, true)),
+        Hexagram(15, "Qian - La Modestie", listOf(false, false, true, false, false, false)),
+        Hexagram(16, "Yu - L'Enthousiasme", listOf(false, false, false, true, false, false)),
+        Hexagram(17, "Sui - La Suite", listOf(true, false, false, true, true, false)),
+        Hexagram(18, "Gu - Le Travail sur ce qui est corrompu", listOf(false, true, true, false, false, true)),
+        Hexagram(19, "Lin - L'Approche", listOf(true, true, false, false, false, false)),
+        Hexagram(20, "Guan - La Contemplation", listOf(false, false, false, false, true, true)),
+        Hexagram(21, "Shi He - Mordre au travers", listOf(true, false, false, true, false, true)),
+        Hexagram(22, "Bi - La Grâce", listOf(true, false, true, false, false, true)),
+        Hexagram(23, "Bo - L'Éclatement", listOf(false, false, false, false, false, true)),
+        Hexagram(24, "Fu - Le Retour", listOf(true, false, false, false, false, false)),
+        Hexagram(25, "Wu Wang - L'Innocence", listOf(true, false, false, true, true, true)),
+        Hexagram(26, "Da Chu - La Force apprivoisée du grand", listOf(true, true, true, false, false, true)),
+        Hexagram(27, "Yi - Les Commissures des lèvres", listOf(true, false, false, false, false, true)),
+        Hexagram(28, "Da Guo - La Prépondérance du grand", listOf(false, true, true, true, true, false)),
+        Hexagram(29, "Kan - L'Insondable, l'Eau", listOf(false, true, false, false, true, false)),
+        Hexagram(30, "Li - Ce qui s'attache, le Feu", listOf(true, false, true, true, false, true)),
+        Hexagram(31, "Xian - L'Influence", listOf(false, false, true, true, true, false)),
+        Hexagram(32, "Heng - La Durée", listOf(false, true, true, true, false, false)),
+        Hexagram(33, "Dun - La Retraite", listOf(false, false, true, true, true, true)),
+        Hexagram(34, "Da Zhuang - La Puissance du grand", listOf(true, true, true, true, false, false)),
+        Hexagram(35, "Jin - Le Progrès", listOf(false, false, false, true, false, true)),
+        Hexagram(36, "Ming Yi - L'Obscurcissement de la lumière", listOf(true, false, true, false, false, false)),
+        Hexagram(37, "Jia Ren - La Famille", listOf(true, false, true, false, true, true)),
+        Hexagram(38, "Kui - L'Opposition", listOf(true, true, false, true, false, true)),
+        Hexagram(39, "Jian - L'Obstacle", listOf(false, false, true, false, true, false)),
+        Hexagram(40, "Jie - La Délivrance", listOf(false, true, false, true, false, false)),
+        Hexagram(41, "Sun - La Diminution", listOf(true, true, false, false, false, true)),
+        Hexagram(42, "Yi - L'Augmentation", listOf(true, false, false, false, true, true)),
+        Hexagram(43, "Guai - La Percée", listOf(true, true, true, true, true, false)),
+        Hexagram(44, "Gou - Venir à la rencontre", listOf(false, true, true, true, true, true)),
+        Hexagram(45, "Cui - Le Rassemblement", listOf(false, false, false, true, true, false)),
+        Hexagram(46, "Sheng - La Poussée vers le haut", listOf(false, true, true, false, false, false)),
+        Hexagram(47, "Kun - L'Accablement", listOf(false, true, false, true, true, false)),
+        Hexagram(48, "Jing - Le Puits", listOf(false, true, true, false, true, false)),
+        Hexagram(49, "Ge - La Révolution", listOf(true, false, true, true, true, false)),
+        Hexagram(50, "Ding - Le Chaudron", listOf(false, true, true, true, false, true)),
+        Hexagram(51, "Zhen - L'Ébranlement, le Tonnerre", listOf(true, false, false, true, false, false)),
+        Hexagram(52, "Gen - L'Immobilisation, la Montagne", listOf(false, false, true, false, false, true)),
+        Hexagram(53, "Jian - Le Développement", listOf(false, false, true, false, true, true)),
+        Hexagram(54, "Gui Mei - L'Épouse voyageuse", listOf(true, true, false, true, false, false)),
+        Hexagram(55, "Feng - L'Abondance", listOf(true, false, true, true, false, false)),
+        Hexagram(56, "Lu - Le Voyageur", listOf(false, false, true, true, false, true)),
+        Hexagram(57, "Xun - Le Doux, le Vent", listOf(false, true, true, false, true, true)),
+        Hexagram(58, "Dui - Le Serein, le Lac", listOf(true, true, false, true, true, false)),
+        Hexagram(59, "Huan - La Dissolution", listOf(false, true, false, false, true, true)),
+        Hexagram(60, "Jie - La Limitation", listOf(true, true, false, false, true, false)),
+        Hexagram(61, "Zhong Fu - La Vérité intérieure", listOf(true, true, false, false, true, true)),
+        Hexagram(62, "Xiao Guo - La Prépondérance du petit", listOf(false, false, true, true, false, false)),
+        Hexagram(63, "Ji Ji - Après l'accomplissement", listOf(true, false, true, false, true, false)),
+        Hexagram(64, "Wei Ji - Avant l'accomplissement", listOf(false, true, false, true, false, true)),
+    )
+
+    /**
+     * Convertit un hexagramme en pattern de 18 steps (6 lignes × 3 steps).
+     * Trait plein = 3 steps ouverts. Trait brisé = ouvert, fermé (centre),
+     * ouvert — recrée visuellement la coupure du trait brisé.
+     */
+    fun toStepPattern(hexagram: Hexagram): List<Boolean> {
+        val steps = mutableListOf<Boolean>()
+        for (lineIsYang in hexagram.lines) {
+            if (lineIsYang) {
+                steps.add(true); steps.add(true); steps.add(true)
+            } else {
+                steps.add(true); steps.add(false); steps.add(true)
+            }
+        }
+        return steps
+    }
+}
+
 object DnbPatterns {
 
     // "Amen simplifié" : squelette syncopé inspiré du break le plus
@@ -697,6 +792,22 @@ class GateEngine(private val context: android.content.Context) {
         pushHistory()
         for (i in pattern.indices) {
             val value = source.getOrElse(i % source.size) { false }
+            pattern[i] = StepConfig(mode = if (value) StepMode.OPEN else StepMode.CLOSED)
+        }
+    }
+
+    /**
+     * Applique un hexagramme du Yi King : force le nombre de steps à 18
+     * (6 lignes × 3 steps) et charge le pattern exact correspondant,
+     * sans répétition ni troncature — contrairement à applyPattern, qui
+     * s'adapte au stepCount existant.
+     */
+    fun applyHexagram(hexagram: YiJingPatterns.Hexagram) {
+        pushHistory()
+        val stepValues = YiJingPatterns.toStepPattern(hexagram)
+        changeStepCount(stepValues.size)
+        for (i in pattern.indices) {
+            val value = stepValues.getOrElse(i) { false }
             pattern[i] = StepConfig(mode = if (value) StepMode.OPEN else StepMode.CLOSED)
         }
     }
@@ -1706,6 +1817,43 @@ fun CasioGateScreen(engine: GateEngine) {
                             "P${slot + 1}",
                             color = if (occupied) Color.Green else Color.LightGray,
                             fontSize = 12.sp
+                        )
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(16.dp))
+
+            Text("Yi King (64 hexagrammes)", color = Color.White, fontSize = 13.sp)
+            Spacer(Modifier.height(4.dp))
+            var yiJingExpanded by remember { mutableStateOf(false) }
+            var selectedHexagram by remember { mutableStateOf<YiJingPatterns.Hexagram?>(null) }
+
+            Box {
+                OutlinedButton(
+                    onClick = { yiJingExpanded = true },
+                    modifier = Modifier.fillMaxWidth(),
+                    contentPadding = PaddingValues(vertical = 4.dp)
+                ) {
+                    Text(
+                        selectedHexagram?.let { "${it.number}. ${it.name}" } ?: "Choisir un hexagramme",
+                        fontSize = 11.sp,
+                        maxLines = 1
+                    )
+                }
+                DropdownMenu(
+                    expanded = yiJingExpanded,
+                    onDismissRequest = { yiJingExpanded = false },
+                    modifier = Modifier.heightIn(max = 320.dp)
+                ) {
+                    YiJingPatterns.all.forEach { hexagram ->
+                        DropdownMenuItem(
+                            text = { Text("${hexagram.number}. ${hexagram.name}", fontSize = 12.sp) },
+                            onClick = {
+                                selectedHexagram = hexagram
+                                engine.applyHexagram(hexagram)
+                                yiJingExpanded = false
+                            }
                         )
                     }
                 }
