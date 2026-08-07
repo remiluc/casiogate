@@ -1907,13 +1907,34 @@ fun CasioGateScreen(engine: GateEngine) {
                 .verticalScroll(rememberScrollState())
         ) {
 
+            // 3 colonnes quand le pattern est un hexagramme (18 steps =
+            // 6 lignes × 3 steps) pour que chaque ligne du Yi King forme
+            // une vraie rangée visuelle lisible. Sinon, 8 colonnes comme
+            // pour un pattern rythmique classique.
+            val gridColumns = if (engine.pattern.size == 18) 3 else 8
+
             LazyVerticalGrid(
-                columns = GridCells.Fixed(8),
+                columns = GridCells.Fixed(gridColumns),
                 modifier = Modifier.height(220.dp),
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                items(engine.pattern.size) { i ->
+                items(engine.pattern.size) { displayIndex ->
+                    // En mode hexagramme (18 steps, 3 colonnes), on
+                    // affiche la ligne 1 (steps 0-2) en bas de la grille
+                    // et la ligne 6 (steps 15-17) en haut — ordre de
+                    // lecture traditionnel du Yi King. L'ordre audio réel
+                    // (step 0 -> step 17) n'est pas affecté, seul
+                    // l'affichage est remappé.
+                    val i = if (gridColumns == 3) {
+                        val totalLines = engine.pattern.size / 3
+                        val displayLine = displayIndex / 3
+                        val colInLine = displayIndex % 3
+                        val realLine = totalLines - 1 - displayLine
+                        realLine * 3 + colInLine
+                    } else {
+                        displayIndex
+                    }
                     val step = engine.pattern[i]
                     Box(
                         modifier = Modifier
