@@ -1913,6 +1913,15 @@ fun CasioGateScreen(engine: GateEngine) {
             // pour un pattern rythmique classique.
             val gridColumns = if (engine.pattern.size == 18) 3 else 8
 
+            // En mode hexagramme, des blocs plus petits pour que les 6
+            // lignes tiennent visibles d'un coup à l'écran, plutôt que de
+            // devoir scroller pour voir l'hexagramme complet.
+            val effectiveCellSize = if (gridColumns == 3) {
+                (stepCellSize * 0.55f)
+            } else {
+                stepCellSize
+            }
+
             LazyVerticalGrid(
                 columns = GridCells.Fixed(gridColumns),
                 modifier = Modifier.height(220.dp),
@@ -1938,7 +1947,7 @@ fun CasioGateScreen(engine: GateEngine) {
                     val step = engine.pattern[i]
                     Box(
                         modifier = Modifier
-                            .size(stepCellSize)
+                            .size(effectiveCellSize)
                             .background(
                                 when {
                                     i == engine.currentStep && playing -> Color.White
